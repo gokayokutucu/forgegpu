@@ -1,0 +1,27 @@
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+
+# .NET build outputs
+bin/
+obj/
+TestResults/
+
+# IDE and OS files
+.vs/
+.vscode/
+.idea/
+*.user
+*.rsuser
+*.suo
+*.swp
+*.sln.docstates
+.DS_Store
+
+# Local agent and editor state
+.claude/
+
+# Logs and temporary files
+*.log
+*.tmp
