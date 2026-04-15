@@ -9,6 +9,12 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ForgeGPU.Infrastructure", "
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ForgeGPU.Api", "ForgeGPU.Api\ForgeGPU.Api.csproj", "{9D250229-F837-4754-9B26-7E13BC44822F}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{0AB3BF05-4346-4AA6-1389-037BE0695223}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ForgeGPU.UnitTests", "tests\ForgeGPU.UnitTests\ForgeGPU.UnitTests.csproj", "{358C0FA6-578C-4623-B236-42AA5DFE5340}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ForgeGPU.IntegrationTests", "tests\ForgeGPU.IntegrationTests\ForgeGPU.IntegrationTests.csproj", "{C51BD7B2-0625-4794-BDB6-60C1F567AD03}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -55,8 +61,36 @@ Global
 		{9D250229-F837-4754-9B26-7E13BC44822F}.Release|x64.Build.0 = Release|Any CPU
 		{9D250229-F837-4754-9B26-7E13BC44822F}.Release|x86.ActiveCfg = Release|Any CPU
 		{9D250229-F837-4754-9B26-7E13BC44822F}.Release|x86.Build.0 = Release|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Debug|x64.Build.0 = Debug|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Debug|x86.Build.0 = Debug|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Release|Any CPU.Build.0 = Release|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Release|x64.ActiveCfg = Release|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Release|x64.Build.0 = Release|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Release|x86.ActiveCfg = Release|Any CPU
+		{358C0FA6-578C-4623-B236-42AA5DFE5340}.Release|x86.Build.0 = Release|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Debug|x64.Build.0 = Debug|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Debug|x86.Build.0 = Debug|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Release|x64.ActiveCfg = Release|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Release|x64.Build.0 = Release|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Release|x86.ActiveCfg = Release|Any CPU
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{358C0FA6-578C-4623-B236-42AA5DFE5340} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
+		{C51BD7B2-0625-4794-BDB6-60C1F567AD03} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 	EndGlobalSection
 EndGlobal

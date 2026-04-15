@@ -1,23 +1,39 @@
 # ForgeGPU
 
-ForgeGPU is a recruiter-facing AI inference orchestration demo built in .NET 10. It models the control plane of an inference platform rather than a generic background-job system: jobs are durably recorded in Postgres, published to Kafka band topics, selected by a coordinator with fair-share logic, assigned to eligible machines using resource-aware best fit, executed by actor-owned machine workers, and exposed through live metrics, a real-time operator dashboard with polling fallback, and repeatable load scenarios.
+ForgeGPU is an AI inference orchestration demo built in .NET 10. It models the control plane of an inference platform: jobs are durably recorded in Postgres, published to Kafka band topics, selected by a coordinator with fair-share logic, assigned to eligible machines using resource-aware best-fit placement, executed by actor-owned machine workers, and exposed through live metrics, a real-time operator dashboard with polling fallback, and repeatable load scenarios.
+
+**The language is .NET. The problems are not.** Scheduling under resource constraints, fair-share selection, actor-oriented ownership, durable truth versus live projection separation — these are infrastructure problems independent of runtime. The codebase is small enough to read in full and large enough to discuss real control-plane tradeoffs.
 
 ![ForgeGPU operator dashboard](dashboard.png)
 
 ## Why This Project Is Interesting
 
-ForgeGPU is designed to show systems thinking in a compact codebase.
+ForgeGPU targets the class of engineering problems that arise in inference infrastructure, not generic background-job processing.
 
 It demonstrates:
-- inference orchestration instead of CRUD-style job handling
-- scheduling under resource constraints
-- actor-inspired control-plane ownership
+- inference request routing and workload orchestration
+- GPU workload scheduling under simulated resource constraints (capacity units, VRAM, model compatibility)
+- fair-share scheduling with exact-weight debit to prevent starvation across traffic classes
+- resource-aware best-fit placement to reduce fragmentation and preserve capacity for heavy workloads
+- actor-oriented control-plane ownership with explicit state boundaries
 - durable truth versus live projection separation
 - batching, retry, timeout, and dead-letter behavior
-- operational visibility through metrics, machine state, recent events, and a dashboard
+- operational visibility through metrics, machine state, recent events, and a live dashboard
 - reproducible load scenarios with `k6`
 
-This makes the repository useful in recruiter and engineering conversations because the design choices are explicit and inspectable.
+The design choices are explicit and inspectable. That makes the codebase useful in engineering conversations about inference platform architecture.
+
+## Why .NET Instead of Python or Rust
+
+The inference platform problems this project explores — scheduling fairness, placement logic, actor-model ownership, durable state separation — are language-independent. .NET 10 with its async runtime, actor mailbox model, and low-allocation primitives is a legitimate platform for building distributed infrastructure.
+
+The implementation choices worth discussing are:
+- how DRR fair-share interacts with exact-weight debit
+- why Kafka is ingress transport and not the scheduler
+- why machine actors own live resource state instead of a shared store
+- why durable truth and live projection are separated
+
+These are the same questions that matter in Python or Rust inference platforms. The language is a detail. The control-plane reasoning is not.
 
 ## Current Implementation
 
@@ -27,7 +43,7 @@ Current implemented capabilities:
 - `CoordinatorActor` as the scheduling brain
 - `MachineActor` as the execution and resource owner
 - internal band buffers with DRR-style fair-share scheduling
-- exact-weight debit preserved for scheduling
+- exact-weight debit preserved for scheduling decisions
 - resource-aware best-fit eligible machine selection
 - durable machine catalog in Postgres
 - live machine projection in Redis
@@ -72,7 +88,7 @@ Current implemented capabilities:
 | Redis | Live projection only | Fast operator visibility for machines and current runtime state |
 | Dashboard + APIs | Read-only operator view | Makes the control plane explainable during demos and load runs |
 
-A useful mental model is:
+A useful mental model:
 - Postgres answers **what is durably true**.
 - Kafka answers **what has arrived for ingress**.
 - CoordinatorActor answers **what should run next**.
@@ -187,7 +203,7 @@ This ownership model keeps the system explainable. There is one place for global
 
 ForgeGPU uses fake heterogeneous machines to make scheduling decisions understandable.
 
-A capacity unit is a simulated abstract scheduling budget. It is not real GPU telemetry. It exists so scheduling and fragmentation are explainable.
+A capacity unit is a simulated abstract scheduling budget. It is not real GPU telemetry. It exists so scheduling and fragmentation are explainable without requiring real hardware.
 
 | Machine | Capacity Units | CPU Score | RAM MB | GPU VRAM MB | Max Parallel Workers | Supported Models |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
@@ -197,9 +213,9 @@ A capacity unit is a simulated abstract scheduling budget. It is not real GPU te
 | `machine-04` Edge Constraint Node | 5 | 16 | 16384 | 4096 | 1 | `gpt-sim-a` |
 | `machine-05` General Purpose Node | 12 | 28 | 24576 | 8192 | 2 | `gpt-sim-b`, `gpt-sim-mix` |
 
-Example intuition:
+The heterogeneity matters: different machines have different VRAM budgets, model compatibility sets, and parallel worker limits. The scheduler must reason about all of these simultaneously, which is the same constraint class as real GPU fleet scheduling.
 
-A 17-unit machine may receive `10w + 5w + 1w + 1w`, instead of draining only tiny jobs or only medium jobs, to balance fairness and resource utilization.
+Example intuition: a 17-unit machine may receive `10w + 5w + 1w + 1w` instead of draining only tiny jobs or only medium jobs, to balance fairness and resource utilization.
 
 ## Job Model
 
@@ -217,7 +233,7 @@ Each job stores:
 Important distinctions:
 - exact weight is authoritative
 - `weightBand` is derived
-- `requiredMemoryMb` is a resource hint
+- `requiredMemoryMb` is a resource hint for placement
 - retry/failure fields keep execution inspectable
 
 ## Weight Bands and Exact Weight
@@ -259,17 +275,17 @@ Behavior:
 - heavier jobs still get a path to selection
 - fairness is applied before machine placement
 
+This is a direct analogue of the scheduling fairness problem in multi-tenant inference platforms: how do you prevent a flood of small fast requests from starving large expensive ones?
+
 ### Best-Fit Eligible Machine
 
-After DRR selects a job, ForgeGPU filters eligible machines and chooses the one that leaves the smallest non-negative remaining capacity after placement.
+After DRR selects a job, ForgeGPU filters eligible machines by capacity, VRAM, and model compatibility, then chooses the one that leaves the smallest non-negative remaining capacity after placement.
 
-That reduces fragmentation and preserves larger machines for heavier work.
+That reduces fragmentation and preserves larger machines for heavier work — the same fragmentation concern that matters in GPU fleet management.
 
-## What “17w” Means in Practice
+## What "17w" Means in Practice
 
 A machine capacity such as `17` is not a promise of "17 jobs per hour" or a literal hardware unit. It is a simulated abstract budget used to make placement explainable.
-
-A few example allocations on a 17-unit machine:
 
 | Example mix | Total | Why it is useful |
 | --- | ---: | --- |
@@ -278,12 +294,8 @@ A few example allocations on a 17-unit machine:
 | `17 x 1w` | 17 | Possible, but often not ideal if heavier work is waiting |
 | `20w` | not eligible | Exceeds the machine's abstract capacity budget |
 
-This is why ForgeGPU keeps:
-- **coarse bands** for ingress grouping
-- **exact weight** for real scheduling debit and resource reasoning
-
-The system is trying to balance two goals at the same time:
-1. fairness for incoming work
+The system balances two goals simultaneously:
+1. fairness for incoming work across traffic classes
 2. efficient use of heterogeneous machine capacity
 
 ## Batching, Reliability, and Observability
@@ -307,6 +319,8 @@ The system is trying to balance two goals at the same time:
 - `GET /jobs/{id}`
 - `GET /jobs/dead-letter`
 - operator dashboard at `/dashboard/`
+
+Observability is not bolted on. The design exposes scheduler decisions, machine state, deferral reasons, and per-job lifecycle in real time. That is the same requirement as operating an inference fleet under production load.
 
 ## Operator Dashboard
 
@@ -363,9 +377,34 @@ Included scenarios:
 - `constrained`
 - `reliability`
 
+## Testing
+
+ForgeGPU includes both unit tests and integration tests.
+
+Coverage focus:
+- weight-band classification boundaries
+- resource estimation
+- best-fit eligible machine selection
+- DRR-style fair-share behavior
+- retry / timeout / dead-letter policy behavior
+- main HTTP flows for jobs, metrics, machines, events, and dashboard route smoke
+
+Run tests:
+
+```bash
+./scripts/forgegpu.sh test unit
+./scripts/forgegpu.sh test integration
+./scripts/forgegpu.sh test all
+```
+
+Notes:
+- unit tests are fast and do not require the full runtime stack
+- integration tests start their own test dependencies and exercise real HTTP behavior
+- prompt markers such as `fail-retry-once`, `slow-timeout`, and `fail-always` are used intentionally in tests to keep failure scenarios explicit and reproducible
+
 ## Watching Load in Real Time
 
-Yes, the intended demo flow is to keep the dashboard open while a load scenario is running.
+The intended demo flow is to keep the dashboard open while a load scenario is running.
 
 Recommended local flow:
 
@@ -375,7 +414,7 @@ Recommended local flow:
 ./scripts/forgegpu.sh load batch --vus 6 --iterations 24
 ```
 
-While the load test is running, the dashboard should let you watch:
+While the load test is running, the dashboard lets you watch:
 - queue-band depth change over time
 - Kafka ingress and consumption movement
 - DRR credit movement across bands
@@ -431,7 +470,7 @@ curl http://localhost:8080/machines
 curl 'http://localhost:8080/events/recent?limit=20'
 ```
 
-For a live demo, keep `/dashboard/` open in a browser while you submit jobs manually or run one of the bundled `k6` scenarios. That gives you a control-room view of ingress, fairness, machine placement, batching, and fallback behavior as it happens.
+For a live demo, keep `/dashboard/` open in a browser while you submit jobs manually or run one of the bundled `k6` scenarios.
 
 ## Script and Runtime Shortcuts
 
@@ -452,32 +491,29 @@ Local runtime note:
 - local development uses a ZooKeeper-less Kafka-compatible runtime
 - the repository currently uses Redpanda in Docker Compose for simple local Kafka semantics
 
-## CV-Ready Framing
+## What This Demonstrates for Infrastructure Platform Work
 
-ForgeGPU demonstrates the kind of engineering decisions that matter in platform and inference infrastructure work:
-- orchestration under constraints
-- actor-inspired control-plane design
-- Kafka ingress separated from scheduling logic
-- durable truth versus live projection separation
-- fair-share scheduling with exact-weight debit
-- machine-aware placement
-- batching
-- reliability semantics
-- observability and operator tooling
-- load-driven validation
+ForgeGPU is a compact but honest demonstration of control-plane thinking:
 
-That is the main value of the project: it is small enough to read, but large enough to discuss real control-plane tradeoffs.
+- **Inference workload orchestration** — jobs have model affinity, resource requirements, and weight classes that the scheduler must reason about simultaneously
+- **Fair-share scheduling** — DRR prevents any single traffic class from monopolizing capacity, directly analogous to multi-tenant inference quota management
+- **Resource-aware placement** — best-fit selection across heterogeneous machines with VRAM, capacity, and model compatibility constraints
+- **Actor-oriented ownership** — one coordinator owns global scheduling decisions, one actor per machine owns live execution state; no shared mutable resource table
+- **Durable truth vs live projection** — Postgres is the source of truth; Redis holds the live view; they are never confused
+- **Fault tolerance** — retryable vs terminal failure classification, capped retry policy, dead-letter state for inspection and replay
+- **Observability that drives decisions** — metrics, machine state, scheduler decision stream, and deferred-job visibility are first-class, not afterthoughts
+- **Load-driven validation** — `k6` scenarios exercise fairness, batching, constrained capacity, and reliability paths reproducibly
 
-## Not in Scope Yet
+The scope is intentionally bounded: no distributed actor failover, no real GPU telemetry, no adaptive scheduling. Those are real production concerns. What is here is designed to be discussable, inspectable, and honest about what it is.
 
-Not implemented yet:
+## Intentional Scope Boundaries
+
+ForgeGPU does not implement:
 - distributed actor runtime or failover
 - real GPU telemetry
-- advanced adaptive scheduling
+- adaptive or predictive scheduling
 - multi-tenant policy layers
 - historical dashboard analytics
 - production-grade durable deferred queue semantics
 
-## Screenshots
-
-The dashboard is structured so screenshots can be added later under a simple `docs/` or `assets/` section without changing the architecture story.
+These are real engineering problems worth a separate conversation. They are not in scope because the goal is a codebase that is fully readable and demonstrable in a single session, not a production system.

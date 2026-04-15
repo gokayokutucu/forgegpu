@@ -5,6 +5,7 @@ using ForgeGPU.Core.InferenceMachines;
 using ForgeGPU.Core.InferenceWorkers;
 using ForgeGPU.Core.Observability;
 using ForgeGPU.Infrastructure.Configuration;
+using ForgeGPU.Infrastructure.Scheduling;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -731,11 +732,6 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         return new LatencySample(queueWaitMs, executionMs, totalLatencyMs);
     }
 
-    private static bool IsRetryable(JobFailureCategory category)
-    {
-        return category is JobFailureCategory.Timeout or JobFailureCategory.ExecutionError;
-    }
-
     private static bool PromptContains(InferenceJob job, string marker)
     {
         return job.Prompt.Contains(marker, StringComparison.OrdinalIgnoreCase);
@@ -769,21 +765,14 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
 
     private sealed class CoordinatorActor
     {
-        private const int MaxSelectionRounds = 32;
-
         private readonly InferenceOrchestrationService _owner;
         private readonly SemaphoreSlim _bufferSignal = new(0);
         private readonly object _bandLock = new();
-        private readonly WeightBand[] _bandOrder = Enum.GetValues<WeightBand>();
-        private readonly Dictionary<WeightBand, Queue<BufferedBandJob>> _bandBuffers;
-        private readonly Dictionary<WeightBand, int> _bandCredits;
-        private int _nextBandIndex;
+        private readonly DeficitRoundRobinBandScheduler _fairShareScheduler = new();
 
         public CoordinatorActor(InferenceOrchestrationService owner)
         {
             _owner = owner;
-            _bandBuffers = _bandOrder.ToDictionary(x => x, _ => new Queue<BufferedBandJob>());
-            _bandCredits = _bandOrder.ToDictionary(x => x, _ => 0);
         }
 
         public Task RunAsync(CancellationToken cancellationToken)
@@ -798,15 +787,8 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         {
             lock (_bandLock)
             {
-                return new FairShareSnapshot(
-                    _bandOrder.ToDictionary(
-                        band => band.ToString(),
-                        band => _bandBuffers[band].Count,
-                        StringComparer.OrdinalIgnoreCase),
-                    _bandOrder.ToDictionary(
-                        band => band.ToString(),
-                        band => _bandCredits[band],
-                        StringComparer.OrdinalIgnoreCase));
+                var snapshot = _fairShareScheduler.GetSnapshot();
+                return new FairShareSnapshot(snapshot.BandBufferDepths, snapshot.BandCredits);
             }
         }
 
@@ -1072,7 +1054,7 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
 
             lock (_bandLock)
             {
-                _bandBuffers[job.WeightBand].Enqueue(new BufferedBandJob(job.Id, job.WeightBand, job.Weight));
+                _fairShareScheduler.Enqueue(job.Id, job.WeightBand, job.Weight);
             }
 
             _bufferSignal.Release();
@@ -1097,39 +1079,10 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                 creditBeforeDebit = 0;
                 creditAfterDebit = 0;
 
-                if (_bandBuffers.Values.All(queue => queue.Count == 0))
+                if (_fairShareScheduler.TrySelectNext(out var selectedJob, out creditBeforeDebit, out creditAfterDebit))
                 {
-                    return false;
-                }
-
-                for (var round = 0; round < MaxSelectionRounds; round++)
-                {
-                    for (var i = 0; i < _bandOrder.Length; i++)
-                    {
-                        var band = _bandOrder[_nextBandIndex];
-                        _nextBandIndex = (_nextBandIndex + 1) % _bandOrder.Length;
-
-                        var queue = _bandBuffers[band];
-                        if (queue.Count == 0)
-                        {
-                            continue;
-                        }
-
-                        _bandCredits[band] += GetQuantum(band);
-                        var candidate = queue.Peek();
-
-                        if (_bandCredits[band] < candidate.ExactWeight)
-                        {
-                            continue;
-                        }
-
-                        queue.Dequeue();
-                        creditBeforeDebit = _bandCredits[band];
-                        _bandCredits[band] -= candidate.ExactWeight;
-                        creditAfterDebit = _bandCredits[band];
-                        bufferedJob = candidate;
-                        return true;
-                    }
+                    bufferedJob = new BufferedBandJob(selectedJob.JobId, selectedJob.WeightBand, selectedJob.ExactWeight);
+                    return true;
                 }
 
                 return false;
@@ -1140,7 +1093,7 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         {
             lock (_bandLock)
             {
-                return _bandBuffers.Values.Sum(queue => queue.Count);
+                return _fairShareScheduler.GetPendingBufferedCount();
             }
         }
 
@@ -1148,22 +1101,8 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         {
             lock (_bandLock)
             {
-                return _bandBuffers[band].Count;
+                return _fairShareScheduler.GetBufferedCount(band);
             }
-        }
-
-        private static int GetQuantum(WeightBand band)
-        {
-            return band switch
-            {
-                WeightBand.W1_2 => 2,
-                WeightBand.W3_5 => 5,
-                WeightBand.W6_10 => 10,
-                WeightBand.W11_20 => 20,
-                WeightBand.W21_40 => 40,
-                WeightBand.W41Plus => 60,
-                _ => 10
-            };
         }
 
         private readonly record struct BufferedBandJob(Guid JobId, WeightBand WeightBand, int ExactWeight);
@@ -1604,7 +1543,7 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                     Interlocked.Increment(ref _owner._totalJobsTimedOut);
                 }
 
-                if (IsRetryable(category) && job.CanRetry())
+                if (ReliabilityPolicy.IsRetryable(category) && job.CanRetry())
                 {
                     job.MarkRetrying(failureReason, category, timestampUtc);
                     await _owner._jobStore.UpdateAsync(job, cancellationToken);
@@ -1635,13 +1574,11 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                     continue;
                 }
 
-                var terminalReason = IsRetryable(category) && !job.CanRetry()
+                var terminalReason = ReliabilityPolicy.IsRetryable(category) && !job.CanRetry()
                     ? $"Retry exhausted after {category}: {failureReason}"
                     : failureReason;
 
-                var terminalCategory = IsRetryable(category) && !job.CanRetry()
-                    ? JobFailureCategory.RetryExhausted
-                    : category;
+                var terminalCategory = ReliabilityPolicy.ResolveTerminalCategory(category, job.CanRetry());
 
                 job.MarkDeadLettered(terminalReason, terminalCategory, timestampUtc);
                 await _owner._jobStore.UpdateAsync(job, cancellationToken);

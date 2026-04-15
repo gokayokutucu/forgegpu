@@ -711,6 +711,33 @@ cmd_dashboard() {
 }
 
 # ===========================================================================
+# Subcommand: test
+# ===========================================================================
+cmd_test() {
+  local suite="${1:-all}"
+  shift || true
+
+  case "${suite}" in
+    unit)
+      info "Running ForgeGPU unit tests..."
+      dotnet test "${REPO_ROOT}/tests/ForgeGPU.UnitTests/ForgeGPU.UnitTests.csproj" "$@"
+      ;;
+    integration)
+      info "Running ForgeGPU integration tests..."
+      dotnet test "${REPO_ROOT}/tests/ForgeGPU.IntegrationTests/ForgeGPU.IntegrationTests.csproj" "$@"
+      ;;
+    all)
+      info "Running all ForgeGPU tests..."
+      dotnet test "${REPO_ROOT}/tests/ForgeGPU.UnitTests/ForgeGPU.UnitTests.csproj" "$@"
+      dotnet test "${REPO_ROOT}/tests/ForgeGPU.IntegrationTests/ForgeGPU.IntegrationTests.csproj" "$@"
+      ;;
+    *)
+      die "Usage: forgegpu.sh test <unit|integration|all> [dotnet test args]"
+      ;;
+  esac
+}
+
+# ===========================================================================
 # Subcommand: load
 # ===========================================================================
 cmd_load() {
@@ -817,6 +844,12 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}dashboard${RESET}
       Print the operator dashboard URL and open it when supported locally.
 
+  ${CYAN}test${RESET} <unit|integration|all> [dotnet test args]
+      Run ForgeGPU automated tests.
+      unit         deterministic unit tests only
+      integration  HTTP/runtime integration tests
+      all          run both suites in sequence
+
   ${CYAN}smoke${RESET} [options]
       End-to-end smoke test: wait for API → submit jobs → poll to completion → summary.
       --build             build and start the stack detached first, then run the test
@@ -879,6 +912,8 @@ ${BOLD}EXAMPLES${RESET}
   ./scripts/forgegpu.sh health
   ./scripts/forgegpu.sh topics
   ./scripts/forgegpu.sh dashboard
+  ./scripts/forgegpu.sh test unit
+  ./scripts/forgegpu.sh test integration
   ./scripts/forgegpu.sh smoke --jobs 5 --weights "50,100,300,900,100"
   ./scripts/forgegpu.sh submit --prompt 'hello "world"' --weight 200
   ./scripts/forgegpu.sh load basic --vus 6 --iterations 24
@@ -905,6 +940,7 @@ case "${COMMAND}" in
   metrics)  cmd_metrics "$@" ;;
   topics)   cmd_topics  "$@" ;;
   dashboard) cmd_dashboard "$@" ;;
+  test)     cmd_test    "$@" ;;
   smoke)    cmd_smoke   "$@" ;;
   logs)     cmd_logs    "$@" ;;
   reset)    cmd_reset   "$@" ;;
