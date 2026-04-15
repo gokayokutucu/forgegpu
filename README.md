@@ -2,9 +2,9 @@
 
 ForgeGPU is a recruiter-facing AI inference orchestration demo built in .NET 10.
 
-Phase 7 introduces a reliability layer on top of the current dispatcher/worker architecture with execution timeouts, retry policy, failure classification, dead-letter direction, and visibility for terminal failures.
+Phase 8 introduces repeatable load testing and benchmark-style measurement on top of the current dispatcher/worker architecture, using k6 scenarios to surface throughput, latency, batching, deferred capacity pressure, and reliability behavior.
 
-## Phase 7 Scope
+## Phase 8 Scope
 
 - Redis ingress queue (job ids only)
 - Postgres durable job state
@@ -21,6 +21,8 @@ Phase 7 introduces a reliability layer on top of the current dispatcher/worker a
 - Retry policy with fixed delay and capped attempts
 - Explicit failure categories and durable retry metadata
 - Dead-letter visibility through durable job state and `GET /jobs/dead-letter`
+- k6-based load scenarios under `load-tests/`
+- operational wrapper commands for repeatable benchmark runs
 
 ## Core Flow
 
@@ -43,6 +45,31 @@ Phase 7 introduces a reliability layer on top of the current dispatcher/worker a
 - `GET /workers`
 - `GET /metrics`
 - `GET /health`
+
+## Load Scenarios
+
+Repository layout:
+
+- `load-tests/submit-and-poll.js`
+- `load-tests/batch-heavy.js`
+- `load-tests/constrained-capacity.js`
+- `load-tests/reliability-mix.js`
+- `load-tests/helpers.js`
+
+What each scenario demonstrates:
+
+- `basic`
+  - concurrent submit + poll
+  - baseline end-to-end latency and throughput
+- `batch`
+  - many compatible jobs for the same model
+  - batching effectiveness and worker-side grouping
+- `constrained`
+  - jobs that pressure model/VRAM compatibility
+  - deferred pending behavior under constrained capacity
+- `reliability`
+  - normal, retry-once, timeout, and retry-exhausted failure paths together
+  - retry/dead-letter behavior under concurrent load
 
 ## POST /jobs Request
 
@@ -114,6 +141,14 @@ cp .env.example .env
 docker compose up --build
 ```
 
+## Load Testing Prerequisites
+
+- `docker compose`
+- `dotnet`
+- optional local `k6`
+
+If `k6` is not installed locally, `./scripts/forgegpu.sh load ...` falls back to the `grafana/k6` Docker image.
+
 ## Quick Validation
 
 ```bash
@@ -145,6 +180,65 @@ curl http://localhost:8080/jobs/dead-letter
 docker compose exec -T forgegpu-postgres \
   psql -U forgegpu -d forgegpu -c "SELECT prompt, status, retry_count, last_failure_category FROM inference_jobs ORDER BY created_at_utc DESC LIMIT 10;"
 ```
+
+## Performance Testing
+
+Start the stack:
+
+```bash
+./scripts/forgegpu.sh up --build --detach
+./scripts/forgegpu.sh health
+```
+
+Run scenarios:
+
+```bash
+# basic concurrent submit + poll
+./scripts/forgegpu.sh load basic --vus 6 --iterations 24
+
+# batch-heavy scenario
+./scripts/forgegpu.sh load batch --vus 8 --iterations 32 --model gpt-sim-a --required-memory 1024
+
+# constrained-capacity scenario
+./scripts/forgegpu.sh load constrained --vus 6 --iterations 18 --model gpt-sim-b --required-memory 14000 --poll-timeout-ms 12000
+
+# reliability mix scenario
+./scripts/forgegpu.sh load reliability --vus 6 --iterations 20 --poll-timeout-ms 90000
+```
+
+For isolated comparisons, reset the stack between runs so Postgres state and in-memory metrics start clean:
+
+```bash
+./scripts/forgegpu.sh reset --yes --rebuild --up
+```
+
+Useful inspection points after each run:
+
+```bash
+./scripts/forgegpu.sh metrics
+./scripts/forgegpu.sh workers
+curl http://localhost:8080/jobs/dead-letter
+```
+
+Optional comparison:
+
+```bash
+# run batch-heavy with batching enabled
+./scripts/forgegpu.sh load batch --vus 8 --iterations 32
+
+# run again with batching disabled for comparison
+BATCHING_ENABLED=false ./scripts/forgegpu.sh reset --yes --rebuild --up
+./scripts/forgegpu.sh load batch --vus 8 --iterations 32
+```
+
+The k6 scenario summary reports:
+
+- iteration and HTTP request rates
+- completed / failed / dead-lettered counts
+- observed retries and deferred pressure
+- average and p95 end-to-end latency
+- queue wait and execution latency
+- end-of-run ForgeGPU `/metrics` and `/workers` snapshots in the log output
 
 ## Not In Scope Yet
 
