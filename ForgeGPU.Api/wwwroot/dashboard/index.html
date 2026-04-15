@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ForgeGPU Operator Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/styles.css" />
+</head>
+<body>
+  <header class="page-header">
+    <div>
+      <p class="eyebrow">ForgeGPU</p>
+      <h1>Operator Dashboard</h1>
+      <p class="subtle">Kafka ingress, coordinator-owned DRR selection, and machine-backed execution.</p>
+    </div>
+    <div class="header-actions">
+      <button id="refreshButton" type="button">Refresh</button>
+      <span id="transportStatus" class="chip warn">Polling fallback</span>
+      <span id="lastUpdated">Last updated: --</span>
+    </div>
+  </header>
+
+  <main class="dashboard-grid">
+    <section class="panel panel-span-12" id="summaryPanel">
+      <h2>Fairness and Utilization Summary</h2>
+      <div class="summary-grid" id="summaryGrid"></div>
+    </section>
+
+    <section class="panel panel-span-12">
+      <h2>Queue Bands and Kafka Ingress</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Band</th>
+              <th>Buffer Depth</th>
+              <th>Credit</th>
+              <th>Accepted</th>
+              <th>Dispatched</th>
+              <th>Completed</th>
+              <th>Deferred</th>
+              <th>Kafka Topic</th>
+              <th>Published</th>
+              <th>Consumed</th>
+              <th>Lag</th>
+            </tr>
+          </thead>
+          <tbody id="bandTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel-span-7">
+      <h2>Machine Cards</h2>
+      <div class="machine-grid" id="machineGrid"></div>
+    </section>
+
+    <section class="panel panel-span-5">
+      <h2>Machine Utilization Heatmap</h2>
+      <div id="heatmapGrid" class="heatmap-grid"></div>
+    </section>
+
+    <section class="panel panel-span-7">
+      <h2>Scheduler Decision Stream</h2>
+      <div class="table-wrap table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Kind</th>
+              <th>Job</th>
+              <th>Band</th>
+              <th>Weight</th>
+              <th>Machine</th>
+              <th>Credit</th>
+              <th>Reason</th>
+              <th>Summary</th>
+            </tr>
+          </thead>
+          <tbody id="eventsTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel-span-5">
+      <h2>Deferred Visibility</h2>
+      <div class="deferred-summary" id="deferredSummary"></div>
+      <div class="table-wrap table-scroll compact-top">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Job</th>
+              <th>Band</th>
+              <th>Reason</th>
+              <th>Summary</th>
+            </tr>
+          </thead>
+          <tbody id="deferredTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/@microsoft/signalr@8.0.7/dist/browser/signalr.min.js"></script>
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>

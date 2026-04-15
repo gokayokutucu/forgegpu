@@ -1,6 +1,4 @@
 using ForgeGPU.Core.InferenceJobs;
-using ForgeGPU.Infrastructure.Configuration;
-using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 
 namespace ForgeGPU.Infrastructure.Queueing;
@@ -8,30 +6,29 @@ namespace ForgeGPU.Infrastructure.Queueing;
 public sealed class RedisJobQueue : IJobQueue
 {
     private readonly IConnectionMultiplexer _redis;
-    private readonly string _queueName;
+    private const string QueueName = "forgegpu:legacy:redis:jobs:queue";
 
-    public RedisJobQueue(IConnectionMultiplexer redis, IOptions<InfrastructureOptions> options)
+    public RedisJobQueue(IConnectionMultiplexer redis)
     {
         _redis = redis;
-        _queueName = options.Value.Redis.QueueName;
     }
 
-    public async ValueTask EnqueueAsync(Guid jobId, CancellationToken cancellationToken)
+    public async ValueTask EnqueueAsync(Guid jobId, WeightBand weightBand, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
         var db = _redis.GetDatabase();
-        await db.ListRightPushAsync(_queueName, jobId.ToString("D"));
+        await db.ListRightPushAsync(QueueName, $"{weightBand}:{jobId:D}");
     }
 
-    public async ValueTask<Guid> DequeueAsync(CancellationToken cancellationToken)
+    public async ValueTask<JobIngressMessage> DequeueAsync(CancellationToken cancellationToken)
     {
         var db = _redis.GetDatabase();
 
         while (!cancellationToken.IsCancellationRequested)
         {
             // BLPOP with small timeout keeps Redis wait efficient and still allows cooperative cancellation.
-            var result = await db.ExecuteAsync("BLPOP", _queueName, "1");
+            var result = await db.ExecuteAsync("BLPOP", QueueName, "1");
 
             if (result.IsNull)
             {
@@ -45,12 +42,23 @@ public sealed class RedisJobQueue : IJobQueue
             }
 
             var value = values[1].ToString();
-            if (Guid.TryParse(value, out var jobId))
+            var parts = value.Split(':', 2, StringSplitOptions.TrimEntries);
+            if (parts.Length == 2
+                && Enum.TryParse<WeightBand>(parts[0], ignoreCase: true, out var weightBand)
+                && Guid.TryParse(parts[1], out var jobId))
             {
-                return jobId;
+                return new JobIngressMessage(jobId, weightBand, "redis-legacy");
             }
         }
 
         throw new OperationCanceledException(cancellationToken);
+    }
+
+    public async ValueTask<long?> GetIngressDepthAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var db = _redis.GetDatabase();
+        return await db.ListLengthAsync(QueueName);
     }
 }

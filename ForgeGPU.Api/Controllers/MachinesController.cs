@@ -1,5 +1,5 @@
 using ForgeGPU.Api.Contracts;
-using ForgeGPU.Core.InferenceMachines;
+using ForgeGPU.Api.Services;
 using Microsoft.AspNetCore.Mvc;
 
 namespace ForgeGPU.Api.Controllers;
@@ -8,62 +8,17 @@ namespace ForgeGPU.Api.Controllers;
 [Route("machines")]
 public sealed class MachinesController : ControllerBase
 {
-    private readonly IMachineStateReader _machineStateReader;
+    private readonly DashboardSnapshotBuilder _snapshotBuilder;
 
-    public MachinesController(IMachineStateReader machineStateReader)
+    public MachinesController(DashboardSnapshotBuilder snapshotBuilder)
     {
-        _machineStateReader = machineStateReader;
+        _snapshotBuilder = snapshotBuilder;
     }
 
     [HttpGet]
     [ProducesResponseType<MachinesSnapshotResponse>(StatusCodes.Status200OK)]
     public async Task<IActionResult> GetMachines(CancellationToken cancellationToken)
     {
-        var machines = (await _machineStateReader.GetMachinesAsync(cancellationToken))
-            .OrderBy(x => x.MachineId)
-            .Select(x => new MachineStateResponse(
-                x.MachineId,
-                new MachineMetadataResponse(
-                    x.Name,
-                    x.Enabled,
-                    x.TotalCapacityUnits,
-                    x.CpuScore,
-                    x.RamMb,
-                    x.GpuVramMb,
-                    x.MaxParallelWorkers,
-                    x.SupportedModels,
-                    x.CreatedAtUtc,
-                    x.UpdatedAtUtc),
-                new MachineLiveStateResponse(
-                    x.ActorInstanceId,
-                    x.ActorStatus,
-                    x.Status,
-                    x.LastHeartbeatUtc,
-                    x.UsedCapacityUnits,
-                    x.RemainingCapacityUnits,
-                    x.CapacityUtilizationPercent,
-                    x.ActiveJobCount,
-                    x.ParallelUtilizationPercent,
-                    x.UsedGpuVramMb,
-                    x.RemainingGpuVramMb,
-                    x.GpuVramUtilizationPercent,
-                    x.RunningJobIds,
-                    x.CurrentModel,
-                    x.CurrentBatchSize,
-                    x.TotalBatchesFormed,
-                    x.LastBatchModel,
-                    x.LastBatchSize,
-                    x.LastBatchCompletedUtc,
-                    x.CompletedJobCount,
-                    x.FailedJobCount),
-                new MachineAvailabilityResponse(
-                    x.LivenessState,
-                    x.IsAvailableForScheduling)))
-            .ToArray();
-
-        return Ok(new MachinesSnapshotResponse(
-            _machineStateReader.GetSchedulerPolicy(),
-            _machineStateReader.GetPendingJobCount(),
-            machines));
+        return Ok(await _snapshotBuilder.BuildMachinesAsync(cancellationToken));
     }
 }

@@ -29,6 +29,10 @@ public sealed record JobMetricsSnapshot(
 public sealed record QueueMetricsSnapshot(
     long? IngressQueueDepth,
     int DeferredPendingCount,
+    IReadOnlyDictionary<string, int> IngressPublishedByTopic,
+    IReadOnlyDictionary<string, int> IngressConsumedByWeightBand,
+    IReadOnlyDictionary<string, int> IngressConsumedByTopic,
+    IReadOnlyDictionary<string, int> IngressLagByTopic,
     IReadOnlyDictionary<string, int> CurrentBandBufferDepths,
     IReadOnlyDictionary<string, int> PendingReasons);
 

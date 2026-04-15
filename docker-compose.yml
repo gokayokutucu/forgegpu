@@ -7,11 +7,19 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
       ASPNETCORE_URLS: http://0.0.0.0:8080
-      Infrastructure__Runtime__QueueProvider: ${INFRASTRUCTURE_QUEUE_PROVIDER:-Redis}
+      Infrastructure__Runtime__QueueProvider: ${INFRASTRUCTURE_QUEUE_PROVIDER:-Kafka}
       Infrastructure__Runtime__JobStoreProvider: ${INFRASTRUCTURE_JOBSTORE_PROVIDER:-Postgres}
       Infrastructure__Redis__ConnectionString: ${REDIS_CONNECTION_STRING:-forgegpu-redis:6379}
-      Infrastructure__Redis__QueueName: ${REDIS_QUEUE_NAME:-forgegpu:inference:jobs:queue}
       Infrastructure__Redis__MachineProjectionKeyPrefix: ${REDIS_MACHINE_PROJECTION_KEY_PREFIX:-forgegpu:machines:live:}
+      Infrastructure__Kafka__BootstrapServers: ${KAFKA_BOOTSTRAP_SERVERS:-forgegpu-kafka:9092}
+      Infrastructure__Kafka__ConsumerGroupId: ${KAFKA_CONSUMER_GROUP_ID:-forgegpu-coordinator}
+      Infrastructure__Kafka__ProducerClientId: ${KAFKA_PRODUCER_CLIENT_ID:-forgegpu-api}
+      Infrastructure__Kafka__Topics__W1_2: ${KAFKA_TOPIC_W1_2:-forgegpu.jobs.w1_2}
+      Infrastructure__Kafka__Topics__W3_5: ${KAFKA_TOPIC_W3_5:-forgegpu.jobs.w3_5}
+      Infrastructure__Kafka__Topics__W6_10: ${KAFKA_TOPIC_W6_10:-forgegpu.jobs.w6_10}
+      Infrastructure__Kafka__Topics__W11_20: ${KAFKA_TOPIC_W11_20:-forgegpu.jobs.w11_20}
+      Infrastructure__Kafka__Topics__W21_40: ${KAFKA_TOPIC_W21_40:-forgegpu.jobs.w21_40}
+      Infrastructure__Kafka__Topics__W41Plus: ${KAFKA_TOPIC_W41_PLUS:-forgegpu.jobs.w41_plus}
       Infrastructure__Postgres__ConnectionString: ${POSTGRES_CONNECTION_STRING:-Host=forgegpu-postgres;Port=5432;Database=forgegpu;Username=forgegpu;Password=forgegpu}
       Infrastructure__WorkerExecution__WorkerCount: ${WORKER_COUNT:-3}
       Infrastructure__WorkerExecution__MaxConcurrentJobsPerWorker: ${MAX_CONCURRENT_JOBS_PER_WORKER:-1}
@@ -31,10 +39,46 @@ services:
     ports:
       - "8080:8080"
     depends_on:
+      forgegpu-kafka:
+        condition: service_healthy
       forgegpu-redis:
         condition: service_healthy
       forgegpu-postgres:
         condition: service_healthy
+    restart: unless-stopped
+
+  forgegpu-kafka:
+    container_name: forgegpu-kafka
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.7
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - "1G"
+      - --reserve-memory
+      - "0M"
+      - --check=false
+      - --node-id
+      - "0"
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://forgegpu-kafka:9092,external://localhost:19092
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082
+      - --advertise-pandaproxy-addr
+      - internal://forgegpu-kafka:8082
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health --exit-when-healthy"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
     restart: unless-stopped
 
   forgegpu-redis:

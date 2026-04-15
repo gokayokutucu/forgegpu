@@ -52,15 +52,17 @@ public sealed class JobsController : ControllerBase
             _options.Reliability.MaxRetries);
 
         await _jobStore.AddAsync(job, cancellationToken);
-        await _jobQueue.EnqueueAsync(job.Id, cancellationToken);
+        await _jobQueue.EnqueueAsync(job.Id, job.WeightBand, cancellationToken);
         _telemetry.RecordJobAccepted(job.Model ?? "unknown", job.WeightBand);
+        _telemetry.RecordIngressPublished(_options.Kafka.GetTopicName(job.WeightBand), job.WeightBand);
 
         _logger.LogInformation(
-            "Accepted inference job {JobId}. Model: {Model}. Weight: {Weight}. WeightBand: {WeightBand}. RequiredMemoryMb: {RequiredMemoryMb}. PromptLength: {PromptLength}.",
+            "Accepted inference job {JobId}. Model: {Model}. Weight: {Weight}. WeightBand: {WeightBand}. KafkaTopic: {KafkaTopic}. RequiredMemoryMb: {RequiredMemoryMb}. PromptLength: {PromptLength}.",
             job.Id,
             job.Model,
             job.Weight,
             job.WeightBand,
+            _options.Kafka.GetTopicName(job.WeightBand),
             job.RequiredMemoryMb,
             job.Prompt.Length);
 

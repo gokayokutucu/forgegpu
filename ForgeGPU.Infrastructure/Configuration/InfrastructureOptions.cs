@@ -1,3 +1,5 @@
+using ForgeGPU.Core.InferenceJobs;
+
 namespace ForgeGPU.Infrastructure.Configuration;
 
 public sealed class InfrastructureOptions
@@ -6,6 +8,7 @@ public sealed class InfrastructureOptions
 
     public RuntimeOptions Runtime { get; init; } = new();
     public RedisOptions Redis { get; init; } = new();
+    public KafkaOptions Kafka { get; init; } = new();
     public PostgresOptions Postgres { get; init; } = new();
     public WorkerExecutionOptions WorkerExecution { get; init; } = new();
     public SchedulingOptions Scheduling { get; init; } = new();
@@ -15,15 +18,59 @@ public sealed class InfrastructureOptions
 
 public sealed class RuntimeOptions
 {
-    public string QueueProvider { get; init; } = "Redis";
+    public string QueueProvider { get; init; } = "Kafka";
     public string JobStoreProvider { get; init; } = "Postgres";
 }
 
 public sealed class RedisOptions
 {
     public string ConnectionString { get; init; } = "localhost:6379";
-    public string QueueName { get; init; } = "forgegpu:inference:jobs:queue";
     public string MachineProjectionKeyPrefix { get; init; } = "forgegpu:machines:live:";
+}
+
+public sealed class KafkaOptions
+{
+    public string BootstrapServers { get; init; } = "localhost:19092";
+    public string ConsumerGroupId { get; init; } = "forgegpu-coordinator";
+    public string ProducerClientId { get; init; } = "forgegpu-api";
+    public WeightBandTopicOptions Topics { get; init; } = new();
+
+    public string GetTopicName(WeightBand band)
+    {
+        return band switch
+        {
+            WeightBand.W1_2 => Topics.W1_2,
+            WeightBand.W3_5 => Topics.W3_5,
+            WeightBand.W6_10 => Topics.W6_10,
+            WeightBand.W11_20 => Topics.W11_20,
+            WeightBand.W21_40 => Topics.W21_40,
+            WeightBand.W41Plus => Topics.W41Plus,
+            _ => throw new ArgumentOutOfRangeException(nameof(band), band, "Unsupported weight band.")
+        };
+    }
+
+    public IReadOnlyDictionary<WeightBand, string> GetTopicMap()
+    {
+        return new Dictionary<WeightBand, string>
+        {
+            [WeightBand.W1_2] = Topics.W1_2,
+            [WeightBand.W3_5] = Topics.W3_5,
+            [WeightBand.W6_10] = Topics.W6_10,
+            [WeightBand.W11_20] = Topics.W11_20,
+            [WeightBand.W21_40] = Topics.W21_40,
+            [WeightBand.W41Plus] = Topics.W41Plus
+        };
+    }
+}
+
+public sealed class WeightBandTopicOptions
+{
+    public string W1_2 { get; init; } = "forgegpu.jobs.w1_2";
+    public string W3_5 { get; init; } = "forgegpu.jobs.w3_5";
+    public string W6_10 { get; init; } = "forgegpu.jobs.w6_10";
+    public string W11_20 { get; init; } = "forgegpu.jobs.w11_20";
+    public string W21_40 { get; init; } = "forgegpu.jobs.w21_40";
+    public string W41Plus { get; init; } = "forgegpu.jobs.w41_plus";
 }
 
 public sealed class PostgresOptions

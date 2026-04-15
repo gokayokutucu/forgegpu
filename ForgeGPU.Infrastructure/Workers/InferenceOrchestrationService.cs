@@ -8,13 +8,13 @@ using ForgeGPU.Infrastructure.Configuration;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using StackExchange.Redis;
 
 namespace ForgeGPU.Infrastructure.Workers;
 
 public sealed class InferenceOrchestrationService : BackgroundService, IWorkerStateReader, IMachineStateReader, IOrchestrationTelemetry
 {
     private const int RecentWindowSize = 20;
+    private const int RecentEventsWindowSize = 200;
 
     private readonly IJobQueue _jobQueue;
     private readonly IJobStore _jobStore;
@@ -22,7 +22,7 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
     private readonly IResourceEstimator _resourceEstimator;
     private readonly IMachineCatalogStore _machineCatalogStore;
     private readonly IMachineLiveProjectionStore _machineLiveProjectionStore;
-    private readonly IConnectionMultiplexer _redis;
+    private readonly IDashboardUpdateNotifier _dashboardUpdateNotifier;
     private readonly ILogger<InferenceOrchestrationService> _logger;
     private readonly InfrastructureOptions _options;
     private readonly ConcurrentDictionary<string, MachineActor> _machines = new(StringComparer.Ordinal);
@@ -32,16 +32,21 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
     private readonly ConcurrentDictionary<Guid, RetryJob> _retryJobs = new();
     private readonly ConcurrentDictionary<Guid, DateTime> _deferredLogTimestamps = new();
     private readonly object _metricsLock = new();
+    private readonly object _recentEventsLock = new();
     private readonly ConcurrentDictionary<string, int> _acceptedByWeightBand = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _completedByWeightBand = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _completedByModel = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _batchesByModel = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _deferredByWeightBand = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> _ingressPublishedByTopic = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> _ingressConsumedByWeightBand = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> _ingressConsumedByTopic = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _dispatchesByWeightBand = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _deferralReasons = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _failureCategories = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<int> _recentBatchSizes = new();
     private readonly Queue<LatencySample> _recentLatencies = new();
+    private readonly Queue<OperationalEvent> _recentEvents = new();
     private readonly CoordinatorActor _coordinator;
 
     private long _totalJobsAccepted;
@@ -70,7 +75,7 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         IResourceEstimator resourceEstimator,
         IMachineCatalogStore machineCatalogStore,
         IMachineLiveProjectionStore machineLiveProjectionStore,
-        IConnectionMultiplexer redis,
+        IDashboardUpdateNotifier dashboardUpdateNotifier,
         IOptions<InfrastructureOptions> options,
         ILogger<InferenceOrchestrationService> logger)
     {
@@ -80,7 +85,7 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         _resourceEstimator = resourceEstimator;
         _machineCatalogStore = machineCatalogStore;
         _machineLiveProjectionStore = machineLiveProjectionStore;
-        _redis = redis;
+        _dashboardUpdateNotifier = dashboardUpdateNotifier;
         _logger = logger;
         _options = options.Value;
         _coordinator = new CoordinatorActor(this);
@@ -116,6 +121,19 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
     {
         Interlocked.Increment(ref _totalJobsAccepted);
         IncrementCounter(_acceptedByWeightBand, weightBand.ToString());
+        _dashboardUpdateNotifier.NotifyStateChanged();
+    }
+
+    public void RecordIngressPublished(string topic, WeightBand weightBand)
+    {
+        IncrementCounter(_ingressPublishedByTopic, topic);
+        _dashboardUpdateNotifier.NotifyStateChanged();
+        AddOperationalEvent(new OperationalEvent(
+            DateTime.UtcNow,
+            "IngressPublished",
+            $"Published job to {topic}.",
+            WeightBand: weightBand,
+            TransportLane: topic));
     }
 
     public void RecordJobDeferred(string reason, WeightBand weightBand)
@@ -124,6 +142,28 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         Interlocked.Increment(ref _schedulerDeferralCount);
         IncrementCounter(_deferralReasons, reason);
         IncrementCounter(_deferredByWeightBand, weightBand.ToString());
+        _dashboardUpdateNotifier.NotifyStateChanged();
+    }
+
+    private void RecordIngressConsumed(WeightBand weightBand, string transportLane)
+    {
+        IncrementCounter(_ingressConsumedByWeightBand, weightBand.ToString());
+        IncrementCounter(_ingressConsumedByTopic, transportLane);
+        _dashboardUpdateNotifier.NotifyStateChanged();
+    }
+
+    private void AddOperationalEvent(OperationalEvent operationalEvent)
+    {
+        lock (_recentEventsLock)
+        {
+            _recentEvents.Enqueue(operationalEvent);
+            while (_recentEvents.Count > RecentEventsWindowSize)
+            {
+                _recentEvents.Dequeue();
+            }
+        }
+
+        _dashboardUpdateNotifier.NotifyStateChanged();
     }
 
     public async ValueTask<OrchestrationMetricsSnapshot> GetSnapshotAsync(CancellationToken cancellationToken)
@@ -162,6 +202,21 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
             recentAverageTotalLatencyMs = _recentLatencies.Count == 0 ? 0 : Math.Round(_recentLatencies.Average(x => x.TotalLatencyMs), 2);
         }
 
+        var ingressPublishedByTopic = SnapshotDictionary(_ingressPublishedByTopic);
+        var ingressConsumedByTopic = SnapshotDictionary(_ingressConsumedByTopic);
+        var ingressLagByTopic = ingressPublishedByTopic
+            .Union(ingressConsumedByTopic.Keys.Select(key => new KeyValuePair<string, int>(key, 0)))
+            .GroupBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group =>
+                {
+                    ingressPublishedByTopic.TryGetValue(group.Key, out var published);
+                    ingressConsumedByTopic.TryGetValue(group.Key, out var consumed);
+                    return Math.Max(0, published - consumed);
+                },
+                StringComparer.OrdinalIgnoreCase);
+
         return new OrchestrationMetricsSnapshot(
             DateTime.UtcNow,
             new JobMetricsSnapshot(
@@ -183,6 +238,10 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
             new QueueMetricsSnapshot(
                 ingressQueueDepth,
                 GetPendingJobCount(),
+                ingressPublishedByTopic,
+                SnapshotDictionary(_ingressConsumedByWeightBand),
+                ingressConsumedByTopic,
+                ingressLagByTopic,
                 fairShareSnapshot.BandBufferDepths,
                 pendingReasons),
             new SchedulerMetricsSnapshot(
@@ -216,6 +275,17 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                 recentAverageQueueWaitMs,
                 recentAverageExecutionMs,
                 recentAverageTotalLatencyMs));
+    }
+
+    public IReadOnlyCollection<OperationalEvent> GetRecentEvents(int limit = 100)
+    {
+        lock (_recentEventsLock)
+        {
+            return _recentEvents
+                .TakeLast(Math.Max(1, limit))
+                .Reverse()
+                .ToArray();
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -419,6 +489,13 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
             machineState.Enabled,
             machineState.ActorStatus,
             machineState.LastHeartbeatUtc);
+
+        AddOperationalEvent(new OperationalEvent(
+            DateTime.UtcNow,
+            "MachineLivenessChanged",
+            $"Machine {machineState.MachineId} liveness changed from {previous} to {machineState.LivenessState}.",
+            MachineId: machineState.MachineId,
+            Reason: $"{previous}->{machineState.LivenessState}"));
     }
 
     private async Task<InferenceJob?> GetJobAsync(Guid jobId, CancellationToken cancellationToken)
@@ -505,7 +582,7 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
             try
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(50, _options.Reliability.RetryDelayMs)));
-                await _jobQueue.EnqueueAsync(job.Id, CancellationToken.None);
+                await _jobQueue.EnqueueAsync(job.Id, job.WeightBand, CancellationToken.None);
                 _logger.LogInformation(
                     "Re-enqueued retry job {JobId}. FailureCategory: {FailureCategory}. Attempt: {RetryCount}/{MaxRetries}.",
                     job.Id,
@@ -541,16 +618,13 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
 
     private async Task<long?> GetIngressQueueDepthAsync(CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-
         try
         {
-            var db = _redis.GetDatabase();
-            return await db.ListLengthAsync(_options.Redis.QueueName);
+            return await _jobQueue.GetIngressDepthAsync(cancellationToken);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to read ingress queue depth for queue {QueueName}.", _options.Redis.QueueName);
+            _logger.LogWarning(ex, "Failed to read ingress transport depth.");
             return null;
         }
     }
@@ -667,6 +741,19 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         return job.Prompt.Contains(marker, StringComparison.OrdinalIgnoreCase);
     }
 
+    private static string CreatePromptPreview(string prompt)
+    {
+        if (string.IsNullOrWhiteSpace(prompt))
+        {
+            return string.Empty;
+        }
+
+        var normalized = prompt.ReplaceLineEndings(" ").Trim();
+        return normalized.Length <= 72
+            ? normalized
+            : $"{normalized[..69]}...";
+    }
+
     private static void IncrementCounter(ConcurrentDictionary<string, int> counters, string key)
     {
         counters.AddOrUpdate(key, 1, static (_, current) => current + 1);
@@ -729,13 +816,34 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
             {
                 try
                 {
-                    var jobId = await _owner._jobQueue.DequeueAsync(cancellationToken);
-                    _owner._logger.LogInformation("CoordinatorActor dequeued job {JobId} from ingress queue.", jobId);
-                    await BufferJobAsync(jobId, "IngressQueue", cancellationToken);
+                    var ingressMessage = await _owner._jobQueue.DequeueAsync(cancellationToken);
+                    _owner.RecordIngressConsumed(ingressMessage.WeightBand, ingressMessage.TransportLane);
+                    _owner.AddOperationalEvent(new OperationalEvent(
+                        DateTime.UtcNow,
+                        "IngressConsumed",
+                        $"Consumed ingress job from {ingressMessage.TransportLane}.",
+                        JobId: ingressMessage.JobId,
+                        WeightBand: ingressMessage.WeightBand,
+                        TransportLane: ingressMessage.TransportLane));
+                    _owner._logger.LogInformation(
+                        "CoordinatorActor consumed ingress job {JobId} from lane {TransportLane}. TransportWeightBand: {TransportWeightBand}.",
+                        ingressMessage.JobId,
+                        ingressMessage.TransportLane,
+                        ingressMessage.WeightBand);
+                    await BufferJobAsync(
+                        ingressMessage.JobId,
+                        $"Kafka:{ingressMessage.TransportLane}",
+                        ingressMessage.WeightBand,
+                        cancellationToken);
                 }
                 catch (OperationCanceledException)
                 {
                     break;
+                }
+                catch (Exception ex)
+                {
+                    _owner._logger.LogError(ex, "CoordinatorActor failed while consuming ingress work.");
+                    await Task.Delay(250, cancellationToken);
                 }
             }
         }
@@ -753,7 +861,7 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                         deferred.JobId,
                         deferred.Reason);
 
-                    await BufferJobAsync(deferred.JobId, "DeferredReconciliation", cancellationToken);
+                    await BufferJobAsync(deferred.JobId, "DeferredReconciliation", expectedBand: null, cancellationToken);
                 }
 
                 await Task.Delay(interval, cancellationToken);
@@ -813,6 +921,18 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                     creditAfterDebit,
                     GetBufferedCount(bufferedJob.WeightBand));
 
+                _owner.AddOperationalEvent(new OperationalEvent(
+                    DateTime.UtcNow,
+                    "BandSelected",
+                    $"Selected band {bufferedJob.WeightBand} for scheduling.",
+                    JobId: job.Id,
+                    PromptPreview: CreatePromptPreview(job.Prompt),
+                    WeightBand: bufferedJob.WeightBand,
+                    ExactWeight: job.Weight,
+                    CreditBefore: creditBeforeDebit,
+                    CreditAfter: creditAfterDebit,
+                    Model: job.Model));
+
                 _owner._logger.LogDebug(
                     "CoordinatorActor evaluated job {JobId}. Estimate: {EffectiveCostUnits} units ({WeightBand}). Evaluations: {Evaluations}",
                     job.Id,
@@ -837,6 +957,17 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                             _owner.GetPendingJobCount());
                     }
 
+                    _owner.AddOperationalEvent(new OperationalEvent(
+                        DateTime.UtcNow,
+                        "JobDeferred",
+                        "Deferred job because no eligible machine was available.",
+                        JobId: job.Id,
+                        PromptPreview: CreatePromptPreview(job.Prompt),
+                        WeightBand: job.WeightBand,
+                        Model: job.Model,
+                        ExactWeight: job.Weight,
+                        Reason: "NoEligibleMachine"));
+
                     continue;
                 }
 
@@ -844,6 +975,16 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                 {
                     _owner.DeferJob(job.Id, "SelectedMachineMissing");
                     _owner.RecordJobDeferred("SelectedMachineMissing", job.WeightBand);
+                    _owner.AddOperationalEvent(new OperationalEvent(
+                        DateTime.UtcNow,
+                        "JobDeferred",
+                        "Deferred job because selected machine actor was missing.",
+                        JobId: job.Id,
+                        PromptPreview: CreatePromptPreview(job.Prompt),
+                        WeightBand: job.WeightBand,
+                        Model: job.Model,
+                        ExactWeight: job.Weight,
+                        Reason: "SelectedMachineMissing"));
                     continue;
                 }
 
@@ -864,6 +1005,18 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                             _owner.GetPendingJobCount());
                     }
 
+                    _owner.AddOperationalEvent(new OperationalEvent(
+                        DateTime.UtcNow,
+                        "JobDeferred",
+                        $"Deferred job because machine {machine.MachineId} rejected assignment.",
+                        JobId: job.Id,
+                        PromptPreview: CreatePromptPreview(job.Prompt),
+                        WeightBand: job.WeightBand,
+                        MachineId: machine.MachineId,
+                        Model: job.Model,
+                        ExactWeight: job.Weight,
+                        Reason: reason));
+
                     continue;
                 }
 
@@ -880,11 +1033,22 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                     machine.ActiveJobCount,
                     machine.MaxParallelWorkers);
 
+                _owner.AddOperationalEvent(new OperationalEvent(
+                    DateTime.UtcNow,
+                    "JobDispatched",
+                    $"Assigned job to machine {machine.MachineId}.",
+                    JobId: job.Id,
+                    PromptPreview: CreatePromptPreview(job.Prompt),
+                    WeightBand: job.WeightBand,
+                    MachineId: machine.MachineId,
+                    Model: job.Model,
+                    ExactWeight: job.Weight));
+
                 _owner.RecordBandDispatch(bufferedJob.WeightBand);
             }
         }
 
-        private async Task BufferJobAsync(Guid jobId, string source, CancellationToken cancellationToken)
+        private async Task BufferJobAsync(Guid jobId, string source, WeightBand? expectedBand, CancellationToken cancellationToken)
         {
             var job = await _owner.GetJobAsync(jobId, cancellationToken);
             if (job is null)
@@ -894,6 +1058,16 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                     jobId,
                     source);
                 return;
+            }
+
+            if (expectedBand.HasValue && expectedBand.Value != job.WeightBand)
+            {
+                _owner._logger.LogWarning(
+                    "CoordinatorActor received job {JobId} from {Source} with transport band {TransportWeightBand}, but durable state resolved to {DurableWeightBand}. Durable state remains authoritative.",
+                    job.Id,
+                    source,
+                    expectedBand.Value,
+                    job.WeightBand);
             }
 
             lock (_bandLock)
@@ -1327,6 +1501,17 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                     ToWorkerState().VramReservedMb,
                     GpuVramMb);
 
+                _owner.AddOperationalEvent(new OperationalEvent(
+                    DateTime.UtcNow,
+                    "BatchFormed",
+                    $"Machine {MachineId} formed batch of {batchJobs.Count}.",
+                    JobId: batchJobs[0].Id,
+                    PromptPreview: CreatePromptPreview(batchJobs[0].Prompt),
+                    WeightBand: batchJobs[0].WeightBand,
+                    MachineId: MachineId,
+                    Model: batchModel,
+                    BatchSize: batchJobs.Count));
+
                 var startedAtUtc = DateTime.UtcNow;
                 foreach (var job in batchJobs)
                 {
@@ -1435,6 +1620,18 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                         job.MaxRetries,
                         _owner._options.Reliability.RetryDelayMs);
 
+                    _owner.AddOperationalEvent(new OperationalEvent(
+                        DateTime.UtcNow,
+                        "RetryScheduled",
+                        $"Scheduled retry for job {job.Id}.",
+                        JobId: job.Id,
+                        PromptPreview: CreatePromptPreview(job.Prompt),
+                        WeightBand: job.WeightBand,
+                        MachineId: MachineId,
+                        Model: job.Model,
+                        ExactWeight: job.Weight,
+                        Reason: category.ToString()));
+
                     continue;
                 }
 
@@ -1463,6 +1660,18 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                     terminalCategory,
                     job.RetryCount,
                     job.MaxRetries);
+
+                _owner.AddOperationalEvent(new OperationalEvent(
+                    DateTime.UtcNow,
+                    "DeadLettered",
+                    $"Moved job {job.Id} to dead letter.",
+                    JobId: job.Id,
+                    PromptPreview: CreatePromptPreview(job.Prompt),
+                    WeightBand: job.WeightBand,
+                    MachineId: MachineId,
+                    Model: job.Model,
+                    ExactWeight: job.Weight,
+                    Reason: terminalCategory.ToString()));
             }
         }
 

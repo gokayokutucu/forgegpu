@@ -343,21 +343,33 @@ ForgeGPU should expose the control plane clearly.
 ### Future dashboard sections
 
 - ingress band depths
+- consumer lag by topic
+- internal band buffer depth
 - machine cards
 - scheduler decision stream
+- dispatches by band
+- completed by band
+- deferred by band
 - fairness summary
 - utilization summary
+- machine utilization heatmap
 - deferred job visibility
 
 ### Practical dashboard intent
 
 The dashboard should show:
 - what each ingress band currently contains
+- consumer lag by topic
+- internal band buffer depth
 - which machines are available or saturated
 - what resources are reserved on each machine
 - which decisions the coordinator is making
+- dispatches by band
+- completed by band
+- deferred by band
 - where fairness credit is accumulating or being spent
 - which jobs are deferred and why
+- how machine utilization trends across the fleet, including a heatmap view
 
 This should remain practical and operational, not vague marketing UI.
 
@@ -422,9 +434,15 @@ This example should connect the fairness layer and the best-fit assignment layer
 
 - dashboard
 - queue band visibility
+- consumer lag by topic
+- internal band buffer depth
 - machine cards
 - scheduler decision stream
+- dispatches by band
+- completed by band
+- deferred by band
 - fairness and utilization summary
+- machine utilization heatmap
 - README `Resource-aware fair scheduling` section
 
 ### Phase 10

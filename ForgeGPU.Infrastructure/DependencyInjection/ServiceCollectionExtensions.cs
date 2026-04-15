@@ -4,6 +4,7 @@ using ForgeGPU.Core.InferenceWorkers;
 using ForgeGPU.Core.Observability;
 using ForgeGPU.Infrastructure.Bootstrap;
 using ForgeGPU.Infrastructure.Configuration;
+using ForgeGPU.Infrastructure.Observability;
 using ForgeGPU.Infrastructure.Projection;
 using ForgeGPU.Infrastructure.Queueing;
 using ForgeGPU.Infrastructure.Scheduling;
@@ -11,6 +12,7 @@ using ForgeGPU.Infrastructure.Storage;
 using ForgeGPU.Infrastructure.Workers;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Npgsql;
 using StackExchange.Redis;
 
@@ -39,7 +41,11 @@ public static class ServiceCollectionExtensions
             return builder.Build();
         });
 
-        if (IsProvider(options.Runtime.QueueProvider, "Redis"))
+        if (IsProvider(options.Runtime.QueueProvider, "Kafka"))
+        {
+            services.AddSingleton<IJobQueue, KafkaJobQueue>();
+        }
+        else if (IsProvider(options.Runtime.QueueProvider, "Redis"))
         {
             services.AddSingleton<IJobQueue, RedisJobQueue>();
         }
@@ -61,12 +67,17 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IMachineLiveProjectionStore, RedisMachineLiveProjectionStore>();
         services.AddSingleton<IResourceEstimator, ResourceEstimator>();
         services.AddSingleton<IMachineScheduler, ResourceAwareMachineScheduler>();
+        services.TryAddSingleton<IDashboardUpdateNotifier, NullDashboardUpdateNotifier>();
         services.AddSingleton<InferenceOrchestrationService>();
         services.AddSingleton<IWorkerStateReader>(sp => sp.GetRequiredService<InferenceOrchestrationService>());
         services.AddSingleton<IMachineStateReader>(sp => sp.GetRequiredService<InferenceOrchestrationService>());
         services.AddSingleton<IOrchestrationTelemetry>(sp => sp.GetRequiredService<InferenceOrchestrationService>());
 
         services.AddHostedService<PostgresSchemaInitializer>();
+        if (IsProvider(options.Runtime.QueueProvider, "Kafka"))
+        {
+            services.AddHostedService<KafkaTopicBootstrapper>();
+        }
         services.AddHostedService(sp => sp.GetRequiredService<InferenceOrchestrationService>());
 
         return services;

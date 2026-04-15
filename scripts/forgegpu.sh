@@ -572,10 +572,11 @@ cmd_logs() {
       --follow|-f) follow=true ;;
       --tail)      tail="${2:?'--tail requires a value'}"; shift ;;
       api)      service="forgegpu-api" ;;
+      kafka)    service="forgegpu-kafka" ;;
       redis)    service="forgegpu-redis" ;;
       postgres) service="forgegpu-postgres" ;;
-      forgegpu-api|forgegpu-redis|forgegpu-postgres) service="$1" ;;
-      *) die "Unknown argument for 'logs': $1  (valid services: api, redis, postgres)" ;;
+      forgegpu-api|forgegpu-kafka|forgegpu-redis|forgegpu-postgres) service="$1" ;;
+      *) die "Unknown argument for 'logs': $1  (valid services: api, kafka, redis, postgres)" ;;
     esac
     shift
   done
@@ -691,6 +692,25 @@ cmd_metrics() {
 }
 
 # ===========================================================================
+# Subcommand: topics
+# ===========================================================================
+cmd_topics() {
+  info "Listing Kafka ingress topics..."
+  dc exec -T forgegpu-kafka rpk topic list
+}
+
+# ===========================================================================
+# Subcommand: dashboard
+# ===========================================================================
+cmd_dashboard() {
+  local url="${API_BASE}/dashboard/"
+  info "Dashboard URL: ${url}"
+  if command -v open >/dev/null 2>&1; then
+    open "${url}" >/dev/null 2>&1 || true
+  fi
+}
+
+# ===========================================================================
 # Subcommand: load
 # ===========================================================================
 cmd_load() {
@@ -791,6 +811,12 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}metrics${RESET}
       Call GET /metrics and print the result.
 
+  ${CYAN}topics${RESET}
+      List Kafka ingress topics from the local Redpanda runtime.
+
+  ${CYAN}dashboard${RESET}
+      Print the operator dashboard URL and open it when supported locally.
+
   ${CYAN}smoke${RESET} [options]
       End-to-end smoke test: wait for API → submit jobs → poll to completion → summary.
       --build             build and start the stack detached first, then run the test
@@ -802,7 +828,7 @@ ${BOLD}COMMANDS${RESET}
       --workers           also print GET /workers during the test
 
   ${CYAN}logs${RESET} [service] [--follow] [--tail <n>]
-      Show docker compose logs. Service shorthand: api | redis | postgres
+      Show docker compose logs. Service shorthand: api | kafka | redis | postgres
       --follow  stream logs (Ctrl+C to stop)
       --tail n  show last n lines only
 
@@ -851,6 +877,8 @@ ${BOLD}DEPENDENCIES${RESET}
 ${BOLD}EXAMPLES${RESET}
   ./scripts/forgegpu.sh up --build
   ./scripts/forgegpu.sh health
+  ./scripts/forgegpu.sh topics
+  ./scripts/forgegpu.sh dashboard
   ./scripts/forgegpu.sh smoke --jobs 5 --weights "50,100,300,900,100"
   ./scripts/forgegpu.sh submit --prompt 'hello "world"' --weight 200
   ./scripts/forgegpu.sh load basic --vus 6 --iterations 24
@@ -875,6 +903,8 @@ case "${COMMAND}" in
   health)   cmd_health  "$@" ;;
   workers)  cmd_workers "$@" ;;
   metrics)  cmd_metrics "$@" ;;
+  topics)   cmd_topics  "$@" ;;
+  dashboard) cmd_dashboard "$@" ;;
   smoke)    cmd_smoke   "$@" ;;
   logs)     cmd_logs    "$@" ;;
   reset)    cmd_reset   "$@" ;;
