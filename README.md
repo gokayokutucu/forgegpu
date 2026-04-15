@@ -2,6 +2,8 @@
 
 ForgeGPU is a recruiter-facing AI inference orchestration demo built in .NET 10. It models the control plane of an inference platform rather than a generic background-job system: jobs are durably recorded in Postgres, published to Kafka band topics, selected by a coordinator with fair-share logic, assigned to eligible machines using resource-aware best fit, executed by actor-owned machine workers, and exposed through live metrics, a real-time operator dashboard with polling fallback, and repeatable load scenarios.
 
+![ForgeGPU operator dashboard](dashboard.png)
+
 ## Why This Project Is Interesting
 
 ForgeGPU is designed to show systems thinking in a compact codebase.
