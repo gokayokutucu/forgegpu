@@ -59,6 +59,24 @@ Current implemented capabilities:
 - Exact weight is never discarded even when jobs are grouped into coarse ingress bands.
 - Best-fit machine selection reduces fragmentation and preserves larger machines for heavier work.
 
+## State Ownership and Data Boundaries
+
+| Layer | Responsibility | Why it exists |
+| --- | --- | --- |
+| Postgres | Durable truth for jobs, machine catalog, retry metadata, and dead-letter state | Durable inspection, replay-safe reasoning, and consistent API reads |
+| Kafka | Ingress transport segmented by coarse weight band | Clean ingress lanes without turning the broker into the scheduler |
+| CoordinatorActor | Scheduling brain | Owns band buffering, DRR-style selection, deferred re-evaluation, and machine assignment |
+| MachineActor | Live execution and resource ownership | Owns reservations, batching, running jobs, and machine-local state |
+| Redis | Live projection only | Fast operator visibility for machines and current runtime state |
+| Dashboard + APIs | Read-only operator view | Makes the control plane explainable during demos and load runs |
+
+A useful mental model is:
+- Postgres answers **what is durably true**.
+- Kafka answers **what has arrived for ingress**.
+- CoordinatorActor answers **what should run next**.
+- MachineActor answers **what is running right now**.
+- Redis answers **what the live system currently looks like**.
+
 ## Architecture Overview
 
 ```mermaid
@@ -85,7 +103,8 @@ flowchart LR
     M2 --> Redis
     MN --> Redis
 
-    API --> Obs[/metrics /machines /workers\n/events/recent /dashboard]
+    API --> Obs[
+        /metrics /machines /workers\n/events/recent /dashboard]
     PG --> Obs
     Redis --> Obs
 ```
@@ -244,6 +263,27 @@ After DRR selects a job, ForgeGPU filters eligible machines and chooses the one 
 
 That reduces fragmentation and preserves larger machines for heavier work.
 
+## What “17w” Means in Practice
+
+A machine capacity such as `17` is not a promise of "17 jobs per hour" or a literal hardware unit. It is a simulated abstract budget used to make placement explainable.
+
+A few example allocations on a 17-unit machine:
+
+| Example mix | Total | Why it is useful |
+| --- | ---: | --- |
+| `10w + 5w + 1w + 1w` | 17 | Good balanced fit with minimal leftover capacity |
+| `5w + 5w + 5w + 1w + 1w` | 17 | Medium-heavy mix still fits without wasting capacity |
+| `17 x 1w` | 17 | Possible, but often not ideal if heavier work is waiting |
+| `20w` | not eligible | Exceeds the machine's abstract capacity budget |
+
+This is why ForgeGPU keeps:
+- **coarse bands** for ingress grouping
+- **exact weight** for real scheduling debit and resource reasoning
+
+The system is trying to balance two goals at the same time:
+1. fairness for incoming work
+2. efficient use of heterogeneous machine capacity
+
 ## Batching, Reliability, and Observability
 
 ### Batching
@@ -283,6 +323,8 @@ Sections:
 
 It is intentionally lightweight: HTML, CSS, JS, and a small SignalR hub served by the existing ASP.NET host.
 
+The dashboard is designed to be kept open during load runs so you can watch the orchestrator react in real time while `k6` or manual traffic is exercising the system.
+
 ## Benchmark and Behavior Summary
 
 ForgeGPU includes `k6` scenarios that demonstrate system behavior rather than synthetic benchmark marketing.
@@ -300,6 +342,28 @@ Included scenarios:
 - `batch`
 - `constrained`
 - `reliability`
+
+## Watching Load in Real Time
+
+Yes, the intended demo flow is to keep the dashboard open while a load scenario is running.
+
+Recommended local flow:
+
+```bash
+./scripts/forgegpu.sh up --build --detach
+./scripts/forgegpu.sh dashboard
+./scripts/forgegpu.sh load batch --vus 6 --iterations 24
+```
+
+While the load test is running, the dashboard should let you watch:
+- queue-band depth change over time
+- Kafka ingress and consumption movement
+- DRR credit movement across bands
+- machine utilization and VRAM reservation changes
+- batch formation events
+- deferred / retry / dead-letter events
+
+Because the dashboard uses SignalR when available and polling as fallback, it is suitable for parallel operator observation during `k6` runs.
 
 ## How to Demo ForgeGPU
 
@@ -347,6 +411,8 @@ curl http://localhost:8080/machines
 curl 'http://localhost:8080/events/recent?limit=20'
 ```
 
+For a live demo, keep `/dashboard/` open in a browser while you submit jobs manually or run one of the bundled `k6` scenarios. That gives you a control-room view of ingress, fairness, machine placement, batching, and fallback behavior as it happens.
+
 ## Script and Runtime Shortcuts
 
 Useful commands:
@@ -358,7 +424,7 @@ Useful commands:
 ./scripts/forgegpu.sh dashboard
 ./scripts/forgegpu.sh metrics
 ./scripts/forgegpu.sh workers
-./scripts/forgegpu.sh load basic --vus 6 --iterations 24
+./scripts/forgegpu.sh load batch --vus 6 --iterations 24
 ./scripts/forgegpu.sh down
 ```
 
