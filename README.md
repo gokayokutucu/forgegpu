@@ -327,6 +327,24 @@ It is intentionally lightweight: HTML, CSS, JS, and a small SignalR hub served b
 
 The dashboard is designed to be kept open during load runs so you can watch the orchestrator react in real time while `k6` or manual traffic is exercising the system.
 
+Top-level summary and ingress view:
+- fairness and utilization summary
+- queue-band depth, Kafka topic counters, and lag visibility
+
+![ForgeGPU dashboard summary and ingress](dashboard-sec-a.png)
+
+Machine capacity and utilization view:
+- machine cards with durable metadata plus live state
+- utilization heatmap for capacity, VRAM, and active load
+
+![ForgeGPU dashboard machine cards and heatmap](dashboard-sec-b.png)
+
+Decision and fallback visibility:
+- recent scheduler decisions
+- deferred-job stream and deferral reasons
+
+![ForgeGPU dashboard scheduler and deferred visibility](dashboard-sec-c.png)
+
 ## Benchmark and Behavior Summary
 
 ForgeGPU includes `k6` scenarios that demonstrate system behavior rather than synthetic benchmark marketing.
