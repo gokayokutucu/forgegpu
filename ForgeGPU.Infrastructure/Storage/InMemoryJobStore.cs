@@ -24,4 +24,16 @@ public sealed class InMemoryJobStore : IJobStore
         _jobs.AddOrUpdate(job.Id, job, (_, _) => job);
         return Task.CompletedTask;
     }
+
+    public Task<IReadOnlyCollection<InferenceJob>> ListDeadLetteredAsync(int limit, CancellationToken cancellationToken)
+    {
+        var jobs = _jobs.Values
+            .Where(x => x.Status == JobStatus.DeadLettered)
+            .OrderByDescending(x => x.CompletedAtUtc)
+            .ThenByDescending(x => x.CreatedAtUtc)
+            .Take(Math.Max(1, limit))
+            .ToArray();
+
+        return Task.FromResult<IReadOnlyCollection<InferenceJob>>(jobs);
+    }
 }

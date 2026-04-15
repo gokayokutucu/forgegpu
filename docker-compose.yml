@@ -7,10 +7,25 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
       ASPNETCORE_URLS: http://0.0.0.0:8080
-      Infrastructure__Runtime__QueueProvider: ${INFRASTRUCTURE_QUEUE_PROVIDER:-InMemory}
-      Infrastructure__Runtime__JobStoreProvider: ${INFRASTRUCTURE_JOBSTORE_PROVIDER:-InMemory}
+      Infrastructure__Runtime__QueueProvider: ${INFRASTRUCTURE_QUEUE_PROVIDER:-Redis}
+      Infrastructure__Runtime__JobStoreProvider: ${INFRASTRUCTURE_JOBSTORE_PROVIDER:-Postgres}
       Infrastructure__Redis__ConnectionString: ${REDIS_CONNECTION_STRING:-forgegpu-redis:6379}
+      Infrastructure__Redis__QueueName: ${REDIS_QUEUE_NAME:-forgegpu:inference:jobs:queue}
       Infrastructure__Postgres__ConnectionString: ${POSTGRES_CONNECTION_STRING:-Host=forgegpu-postgres;Port=5432;Database=forgegpu;Username=forgegpu;Password=forgegpu}
+      Infrastructure__WorkerExecution__WorkerCount: ${WORKER_COUNT:-3}
+      Infrastructure__WorkerExecution__MaxConcurrentJobsPerWorker: ${MAX_CONCURRENT_JOBS_PER_WORKER:-1}
+      Infrastructure__WorkerExecution__HeartbeatIntervalSeconds: ${WORKER_HEARTBEAT_INTERVAL_SECONDS:-5}
+      Infrastructure__WorkerExecution__SchedulerPolicy: ${WORKER_SCHEDULER_POLICY:-LeastLoadedGpuAware}
+      Infrastructure__Scheduling__DefaultModel: ${DEFAULT_MODEL:-gpt-sim-a}
+      Infrastructure__Scheduling__DefaultRequiredMemoryMb: ${DEFAULT_REQUIRED_MEMORY_MB:-4096}
+      Infrastructure__Scheduling__DeferRetryDelayMs: ${DEFER_RETRY_DELAY_MS:-250}
+      Infrastructure__Batching__Enabled: ${BATCHING_ENABLED:-true}
+      Infrastructure__Batching__BatchWindowMs: ${BATCH_WINDOW_MS:-50}
+      Infrastructure__Batching__MaxBatchSize: ${MAX_BATCH_SIZE:-4}
+      Infrastructure__Batching__MaxBatchMemoryMb: ${MAX_BATCH_MEMORY_MB:-16384}
+      Infrastructure__Reliability__MaxRetries: ${MAX_RETRIES:-2}
+      Infrastructure__Reliability__ExecutionTimeoutMs: ${EXECUTION_TIMEOUT_MS:-2500}
+      Infrastructure__Reliability__RetryDelayMs: ${RETRY_DELAY_MS:-500}
     ports:
       - "8080:8080"
     depends_on:
