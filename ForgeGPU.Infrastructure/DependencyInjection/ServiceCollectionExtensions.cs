@@ -1,8 +1,10 @@
 using ForgeGPU.Core.InferenceJobs;
+using ForgeGPU.Core.InferenceMachines;
 using ForgeGPU.Core.InferenceWorkers;
 using ForgeGPU.Core.Observability;
 using ForgeGPU.Infrastructure.Bootstrap;
 using ForgeGPU.Infrastructure.Configuration;
+using ForgeGPU.Infrastructure.Projection;
 using ForgeGPU.Infrastructure.Queueing;
 using ForgeGPU.Infrastructure.Scheduling;
 using ForgeGPU.Infrastructure.Storage;
@@ -55,9 +57,13 @@ public static class ServiceCollectionExtensions
             services.AddSingleton<IJobStore, InMemoryJobStore>();
         }
 
-        services.AddSingleton<IWorkerScheduler, LeastLoadedWorkerScheduler>();
+        services.AddSingleton<IMachineCatalogStore, PostgresMachineCatalogStore>();
+        services.AddSingleton<IMachineLiveProjectionStore, RedisMachineLiveProjectionStore>();
+        services.AddSingleton<IResourceEstimator, ResourceEstimator>();
+        services.AddSingleton<IMachineScheduler, ResourceAwareMachineScheduler>();
         services.AddSingleton<InferenceOrchestrationService>();
         services.AddSingleton<IWorkerStateReader>(sp => sp.GetRequiredService<InferenceOrchestrationService>());
+        services.AddSingleton<IMachineStateReader>(sp => sp.GetRequiredService<InferenceOrchestrationService>());
         services.AddSingleton<IOrchestrationTelemetry>(sp => sp.GetRequiredService<InferenceOrchestrationService>());
 
         services.AddHostedService<PostgresSchemaInitializer>();

@@ -17,6 +17,7 @@ public sealed class InferenceJob
     public string Prompt { get; }
     public string? Model { get; }
     public int Weight { get; }
+    public WeightBand WeightBand => WeightBandClassifier.Classify(Weight);
     public int RequiredMemoryMb { get; }
     public int RetryCount { get; private set; }
     public int MaxRetries { get; }

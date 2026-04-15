@@ -23,6 +23,7 @@ public sealed class RedisOptions
 {
     public string ConnectionString { get; init; } = "localhost:6379";
     public string QueueName { get; init; } = "forgegpu:inference:jobs:queue";
+    public string MachineProjectionKeyPrefix { get; init; } = "forgegpu:machines:live:";
 }
 
 public sealed class PostgresOptions
@@ -32,11 +33,12 @@ public sealed class PostgresOptions
 
 public sealed class WorkerExecutionOptions
 {
-    public int WorkerCount { get; init; } = 3;
+    public int WorkerCount { get; init; } = 5;
     public int MaxConcurrentJobsPerWorker { get; init; } = 1;
     public int HeartbeatIntervalSeconds { get; init; } = 5;
-    public string SchedulerPolicy { get; init; } = "LeastLoadedGpuAware";
-    public IReadOnlyCollection<WorkerDefinition> Workers { get; init; } = [];
+    public int HeartbeatTtlSeconds { get; init; } = 15;
+    public string SchedulerPolicy { get; init; } = "ResourceAwareBestFit";
+    public IReadOnlyCollection<MachineDefinition> Machines { get; init; } = [];
 }
 
 public sealed class SchedulingOptions
@@ -67,13 +69,16 @@ public sealed class ReliabilityOptions
     public int RetryDelayMs { get; init; } = 500;
 }
 
-public sealed class WorkerDefinition
+public sealed class MachineDefinition
 {
-    public string WorkerId { get; init; } = string.Empty;
+    public string MachineId { get; init; } = string.Empty;
     public string Name { get; init; } = string.Empty;
-    public string GpuId { get; init; } = "GPU-0";
-    public int VramTotalMb { get; init; } = 12288;
-    public int MaxConcurrentJobs { get; init; } = 1;
+    public bool Enabled { get; init; } = true;
+    public int TotalCapacityUnits { get; init; } = 12;
+    public int CpuScore { get; init; } = 24;
+    public int RamMb { get; init; } = 32768;
+    public int GpuVramMb { get; init; } = 8192;
+    public int MaxParallelWorkers { get; init; } = 1;
     public IReadOnlyCollection<string> SupportedModels { get; init; } = [];
 }
 

@@ -34,17 +34,23 @@ public sealed class MetricsController : ControllerBase
                 snapshot.Jobs.DeadLetterCount,
                 snapshot.Jobs.TotalDeferred,
                 snapshot.Jobs.CurrentProcessing,
+                snapshot.Jobs.AcceptedByWeightBand,
+                snapshot.Jobs.CompletedByWeightBand,
+                snapshot.Jobs.DeferredByWeightBand,
                 snapshot.Jobs.CompletedByModel,
                 snapshot.Jobs.FailuresByCategory),
             new QueueMetricsResponse(
                 snapshot.Queue.IngressQueueDepth,
                 snapshot.Queue.DeferredPendingCount,
+                snapshot.Queue.CurrentBandBufferDepths,
                 snapshot.Queue.PendingReasons),
             new SchedulerMetricsResponse(
                 snapshot.Scheduler.Policy,
                 snapshot.Scheduler.TotalDecisions,
                 snapshot.Scheduler.SuccessfulDispatches,
                 snapshot.Scheduler.Deferrals,
+                snapshot.Scheduler.DispatchesByWeightBand,
+                snapshot.Scheduler.BandCredits,
                 snapshot.Scheduler.DeferralReasons),
             new BatchMetricsResponse(
                 snapshot.Batching.TotalBatchesFormed,

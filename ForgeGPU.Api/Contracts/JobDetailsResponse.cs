@@ -7,6 +7,7 @@ public sealed record JobDetailsResponse(
     string Prompt,
     string? Model,
     int Weight,
+    WeightBand WeightBand,
     int RequiredMemoryMb,
     int RetryCount,
     int MaxRetries,

@@ -20,12 +20,16 @@ public sealed record JobMetricsSnapshot(
     long DeadLetterCount,
     long TotalDeferred,
     int CurrentProcessing,
+    IReadOnlyDictionary<string, int> AcceptedByWeightBand,
+    IReadOnlyDictionary<string, int> CompletedByWeightBand,
+    IReadOnlyDictionary<string, int> DeferredByWeightBand,
     IReadOnlyDictionary<string, int> CompletedByModel,
     IReadOnlyDictionary<string, int> FailuresByCategory);
 
 public sealed record QueueMetricsSnapshot(
     long? IngressQueueDepth,
     int DeferredPendingCount,
+    IReadOnlyDictionary<string, int> CurrentBandBufferDepths,
     IReadOnlyDictionary<string, int> PendingReasons);
 
 public sealed record SchedulerMetricsSnapshot(
@@ -33,6 +37,8 @@ public sealed record SchedulerMetricsSnapshot(
     long TotalDecisions,
     long SuccessfulDispatches,
     long Deferrals,
+    IReadOnlyDictionary<string, int> DispatchesByWeightBand,
+    IReadOnlyDictionary<string, int> BandCredits,
     IReadOnlyDictionary<string, int> DeferralReasons);
 
 public sealed record BatchMetricsSnapshot(

@@ -2,247 +2,463 @@
 
 ForgeGPU is a recruiter-facing AI inference orchestration demo built in .NET 10.
 
-Phase 8 introduces repeatable load testing and benchmark-style measurement on top of the current dispatcher/worker architecture, using k6 scenarios to surface throughput, latency, batching, deferred capacity pressure, and reliability behavior.
+It already implements a meaningful vertical slice of an inference control plane:
+- durable job state in Postgres
+- ingress transport through Redis
+- an explicit dispatcher/coordinator flow
+- machine-backed execution with actor-oriented ownership
+- batching
+- observability
+- reliability semantics
+- repeatable load testing
 
-## Phase 8 Scope
+ForgeGPU is evolving toward a more complete resource-aware scheduling story:
+- actor-oriented control plane refinement
+- resource-aware fair scheduling
+- durable machine catalog plus live state projection
+- band-based ingress routing
+- planned operator dashboard visibility
 
-- Redis ingress queue (job ids only)
-- Postgres durable job state
-- Dispatcher/coordinator flow
-- In-process worker pool with explicit GPU capability metadata
-- Admission control (model compatibility + VRAM + execution slots)
-- Least-loaded GPU-aware scheduler foundation
-- Deferred in-process pending queue when no worker is eligible
-- Dynamic batching at the worker mailbox side
-- Batch-aware worker accounting
-- `/workers` worker/resource visibility
-- `/metrics` system visibility for queue, scheduler, batching, utilization, and latency
-- Timeout handling for worker execution
-- Retry policy with fixed delay and capped attempts
-- Explicit failure categories and durable retry metadata
-- Dead-letter visibility through durable job state and `GET /jobs/dead-letter`
-- k6-based load scenarios under `load-tests/`
-- operational wrapper commands for repeatable benchmark runs
+The point of the project is not generic background processing. It models the control-plane decisions of an inference platform under resource constraints, fairness requirements, and failure handling.
 
-## Core Flow
+## Current State vs Target State
 
-1. API inserts durable job row in Postgres.
-2. API enqueues job id to Redis.
-3. Dispatcher dequeues from Redis.
-4. Scheduler evaluates eligibility across workers.
-5. Eligible job is dispatched to worker mailbox.
-6. Worker collects a short compatible batch window and processes one execution unit.
-7. Worker reserves/releases simulated VRAM and updates durable job state per job.
-8. Ineligible jobs are deferred and retried.
-9. Retryable execution failures are delayed and re-enqueued through the ingress queue.
-10. Retry-exhausted or non-retryable jobs become dead-lettered terminal failures.
+| Area | Current state | Target state |
+| --- | --- | --- |
+| Ingress transport | Redis list ingress with job ids only | Kafka band-topic ingress aligned to coarse weight bands |
+| Durable state | Postgres stores durable job state and machine catalog | Postgres remains durable source of truth for jobs, machines, and configuration |
+| Orchestration | Coordinator-owned orchestration with internal band buffers | CoordinatorActor remains central control-plane owner with richer fairness and operator tooling |
+| Machine model | Heterogeneous fake machines with durable catalog and live Redis projection | Same model, refined with stronger operator surfaces and richer scheduling inputs |
+| Scheduling | Resource-aware best-fit machine selection plus internal fair-share pull across bands | Fair-share band scheduling refined further and aligned with Kafka ingress bands |
+| Fairness | Internal Deficit Round Robin style scheduling across weight bands | Kafka-aligned band fairness with stronger fairness controls and visibility |
+| Batching | Worker-side dynamic batching is implemented | Further tuning and evaluation, without changing control-plane ownership |
+| Observability | `GET /metrics`, `GET /workers`, and `GET /machines` expose live state | Planned operator dashboard on top of the same state model |
+| Reliability | Timeouts, retries, failure classification, dead-letter state | More durable/recoverable retry orchestration and richer operational history |
+| Dashboard | No full UI dashboard yet | Planned operator dashboard for bands, machines, scheduler decisions, and utilization |
 
-## API Endpoints
+## Why ForgeGPU Exists
 
-- `POST /jobs`
-- `GET /jobs/{id}`
-- `GET /jobs/dead-letter`
-- `GET /workers`
-- `GET /metrics`
-- `GET /health`
+ForgeGPU exists to demonstrate how an inference platform thinks about scheduling, placement, and execution under constraints.
 
-## Load Scenarios
+This is not just a job queue and not just a worker pool. The interesting part is the control plane:
+- which job gets attention first
+- which machine is eligible
+- why one machine is chosen instead of another
+- what happens when capacity is unavailable
+- how fairness and efficiency are balanced
+- how failures, retries, and terminal outcomes remain inspectable
 
-Repository layout:
+The design aims to balance fairness for customers and efficient resource usage for the platform.
 
-- `load-tests/submit-and-poll.js`
-- `load-tests/batch-heavy.js`
-- `load-tests/constrained-capacity.js`
-- `load-tests/reliability-mix.js`
-- `load-tests/helpers.js`
+## Core Design Principles
 
-What each scenario demonstrates:
+- Postgres is the durable source of truth for durable entities and configuration.
+- Redis holds live projections and ingress state, not durable truth.
+- Actor-owned in-memory state is the authoritative live execution state.
+- Exact weight remains authoritative for scheduling and accounting.
+- Coarse bands are for ingress grouping only.
+- Workers and machines must not directly consume from future Kafka ingress lanes.
+- The Orchestrator / Coordinator sits between ingress and machine execution.
+- A central Coordinator owns assignment decisions.
+- Machine actors own resource reservations and execution state.
+- Exact weight is never discarded even when jobs are grouped into coarse ingress bands.
 
-- `basic`
-  - concurrent submit + poll
-  - baseline end-to-end latency and throughput
-- `batch`
-  - many compatible jobs for the same model
-  - batching effectiveness and worker-side grouping
-- `constrained`
-  - jobs that pressure model/VRAM compatibility
-  - deferred pending behavior under constrained capacity
-- `reliability`
-  - normal, retry-once, timeout, and retry-exhausted failure paths together
-  - retry/dead-letter behavior under concurrent load
+## System Architecture Overview
 
-## POST /jobs Request
+```mermaid
+flowchart LR
+    Client[Client / Caller] --> API[ForgeGPU.Api]
+    API --> PG[(Postgres\nDurable Jobs + Machine Catalog)]
+    API --> RQ[(Redis\nIngress Queue)]
 
-```json
-{
-  "prompt": "run simulation",
-  "model": "gpt-sim-b",
-  "weight": 300,
-  "requiredMemoryMb": 8192
-}
+    RQ --> C[CoordinatorActor / Orchestrator]
+    PG --> C
+    C --> MB1[MachineActor 01 Mailbox]
+    C --> MB2[MachineActor 02 Mailbox]
+    C --> MB3[MachineActor N Mailbox]
+
+    MB1 --> M1[MachineActor 01\nLive Resource State]
+    MB2 --> M2[MachineActor 02\nLive Resource State]
+    MB3 --> MN[MachineActor N\nLive Resource State]
+
+    M1 --> PG
+    M2 --> PG
+    MN --> PG
+
+    M1 --> RP[(Redis\nLive Machine Projection)]
+    M2 --> RP
+    MN --> RP
+
+    API --> Obs[/metrics, /workers, /machines]
+    PG --> Obs
+    RP --> Obs
+    C --> Obs
 ```
 
-Notes:
-- `model` optional, defaults to `Infrastructure:Scheduling:DefaultModel`
-- `weight` optional, defaults to `100`, valid range `1..1000`
-- `requiredMemoryMb` optional, derived from model defaults if omitted
-- `maxRetries` is configured server-side via `Infrastructure:Reliability:MaxRetries`
+What this diagram shows:
+- jobs enter through the API
+- durable job state is written before execution
+- ingress transport is separated from execution ownership
+- the coordinator performs scheduling and assignment
+- machine actors own live state and execution
+- observability is exposed through API surfaces backed by durable and live state
 
-## Reliability Rules
+## Communication and Control Flow
 
-- Retryable categories:
-  - `Timeout`
-  - `ExecutionError`
-- Terminal categories:
-  - `NonRetryableError`
-  - `RetryExhausted`
-- Batch failures are handled per job with a shared failure cause.
-- Retry scheduling uses a fixed delay and keeps the orchestration path explicit.
-- Dead-letter jobs remain queryable from Postgres and through `GET /jobs/dead-letter`.
+### Normal execution flow
 
-## Batching Rules
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as ForgeGPU.Api
+    participant PG as Postgres
+    participant Redis as Redis Ingress
+    participant Coord as CoordinatorActor
+    participant Machine as MachineActor
+    participant Metrics as Metrics/Visibility
 
-- Jobs may batch only when they share the same `model`.
-- Batch memory uses a simple deterministic formula: sum of `requiredMemoryMb` across jobs in the batch.
-- A worker forms a batch only within a short configurable window.
-- A batch is capped by `MaxBatchSize` and `MaxBatchMemoryMb`.
+    Client->>API: POST /jobs
+    API->>PG: Insert durable job row
+    API->>Redis: Enqueue job id
+    Redis->>Coord: Dequeue job id
+    Coord->>Coord: Classify into weight band buffer
+    Coord->>Coord: Fair-share band selection
+    Coord->>Coord: Best-fit eligible machine selection
+    Coord->>Machine: Assign job to mailbox
+    Machine->>Machine: Reserve capacity + optional batch formation
+    Machine->>PG: Mark Processing / Completed / Failed
+    Machine->>Metrics: Update live state and counters
+    Client->>API: GET /jobs/{id}
+    API->>PG: Read durable state
+```
 
-## GET /workers Response Highlights
+### Deferred, retry, and terminal-failure paths
 
-Returns:
-- scheduler policy
-- pending/deferred job count
-- per-worker identity and state
-- GPU id, total/reserved/available VRAM
-- supported models
-- assigned job ids
-- current batch size
-- total batches formed
-- last batch summary
-- completed and failed job counts per worker
-- live job and VRAM utilization percentages
+```mermaid
+flowchart TD
+    A[Selected job] --> B{Eligible machine exists?}
+    B -- No --> C[Deferred under Coordinator ownership]
+    C --> D[Reconciliation tick retries placement]
 
-## GET /metrics Response Highlights
+    B -- Yes --> E[MachineActor executes job or batch]
+    E --> F{Execution succeeds?}
+    F -- Yes --> G[Completed in Postgres]
+    F -- No --> H{Retryable failure?}
+    H -- Yes --> I[Retry delay + re-enqueue]
+    H -- No --> J[Dead-lettered terminal failure]
+    I --> D
+```
 
-Returns:
-- total accepted/completed/failed/deferred jobs
-- total retried/timed-out/terminal-failed/dead-lettered jobs
-- ingress queue depth and deferred pending count
-- scheduler decision, dispatch, and deferral counts
-- batch totals and average batch size
-- aggregate worker utilization and VRAM usage
-- queue wait, execution, and total latency averages
-- failure counts by category
+## Actor-Oriented Orchestration
 
-## Quick Run
+ForgeGPU uses a lightweight actor-inspired design because ownership matters.
+
+This is not a heavyweight external actor framework. The implementation is intentionally simple: channels, mailboxes, owned state, and explicit control flow.
+
+### CoordinatorActor responsibilities
+
+- pull jobs from the ingress path
+- classify jobs into internal band buffers
+- apply fair-share selection across bands
+- inspect machine snapshots and liveness
+- choose the best-fit eligible machine
+- assign jobs to machine mailboxes
+- own deferred-job reconciliation
+
+### MachineActor responsibilities
+
+- own live machine resource state
+- reserve and release capacity units
+- reserve and release simulated VRAM
+- own running-job membership
+- execute assigned work
+- form worker-side batches when compatible
+- publish heartbeat and live projection
+- participate in retry, timeout, and failure behavior
+
+Why this helps:
+- scheduling remains explainable because one place owns assignment
+- machine state remains consistent because one actor owns reservations
+- Redis remains projection-only instead of becoming hidden truth
+- future transport changes can happen without breaking execution ownership
+
+## Machine Model
+
+ForgeGPU uses fake heterogeneous machines to make resource-aware scheduling explainable.
+
+A capacity unit is a simulated abstract resource budget. It is not real hardware telemetry. It exists to make placement decisions readable and to show how fragmentation, fairness, and saturation interact.
+
+### Current demo machine profiles
+
+| Machine | Capacity Units | CPU Score | RAM MB | GPU VRAM MB | Max Parallel Workers | Supported Models |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `machine-01` A100 Heavy Node | 15 | 42 | 32768 | 12288 | 2 | `gpt-sim-a`, `gpt-sim-mix` |
+| `machine-02` L4 Throughput Node | 20 | 36 | 49152 | 16384 | 3 | `gpt-sim-b`, `gpt-sim-mix` |
+| `machine-03` Balanced Multi-Model Node | 17 | 40 | 65536 | 14336 | 2 | `gpt-sim-a`, `gpt-sim-b`, `gpt-sim-mix` |
+| `machine-04` Edge Constraint Node | 5 | 16 | 16384 | 4096 | 1 | `gpt-sim-a` |
+| `machine-05` General Purpose Node | 12 | 28 | 24576 | 8192 | 2 | `gpt-sim-b`, `gpt-sim-mix` |
+
+Concrete example:
+
+A 17-unit machine may receive `10w + 5w + 1w + 1w`, instead of only `1w` jobs or only medium jobs, to balance fairness and resource utilization.
+
+## Job Model
+
+Each job keeps both durable execution state and scheduling-relevant metadata.
+
+Key fields include:
+- `prompt`
+- `model`
+- `weight`
+- `weightBand`
+- `requiredMemoryMb`
+- `status`
+- `retryCount`
+- `maxRetries`
+- `lastFailureReason`
+- `lastFailureCategory`
+- timestamps such as `CreatedAtUtc`, `StartedAtUtc`, `CompletedAtUtc`, `LastAttemptAtUtc`
+
+Why this matters:
+- exact weight is preserved and remains authoritative
+- `weightBand` is derived and used for ingress grouping
+- `requiredMemoryMb` is a resource hint for placement
+- retry and failure metadata keep execution inspectable
+- durable timestamps make latency and lifecycle observable
+
+## Weight Bands
+
+**ForgeGPU uses coarse resource bands for ingress grouping and exact weight for scheduling decisions.**
+
+ForgeGPU does not create one queue per exact weight. That would create too many ingress lanes, make the transport harder to reason about, and weaken the story around fairness versus placement.
+
+Instead, ForgeGPU groups jobs into coarse bands while preserving exact weight on every job.
+
+| Band name | Weight range | Why it exists |
+| --- | --- | --- |
+| `W1_2` | `1-2` | Keep very small jobs granular without exploding ingress lanes |
+| `W3_5` | `3-5` | Capture small-but-nontrivial work as a separate fairness lane |
+| `W6_10` | `6-10` | Represent moderate work without treating every exact value as its own lane |
+| `W11_20` | `11-20` | Group heavier jobs that should not be starved behind tiny work |
+| `W21_40` | `21-40` | Represent large work classes that need visible fairness treatment |
+| `W41Plus` | `41+` | Provide a coarse lane for very heavy jobs without one-topic-per-weight explosion |
+
+Why this model exists:
+- bands keep ingress lanes understandable
+- exact weight still drives real scheduling and accounting
+- later phases can align Kafka ingress to the same bands without discarding precise job cost
+
+## Scheduling Algorithms
+
+### Best-Fit Eligible Machine
+
+ForgeGPU currently performs machine selection by filtering to eligible machines and then choosing the best fit.
+
+Among eligible machines, the system chooses the one that leaves the smallest non-negative remaining capacity after placement. Best-fit machine selection reduces fragmentation and preserves larger machines for heavier work.
+
+Eligibility checks include:
+- durable machine enabled state
+- live heartbeat/liveness availability
+- supported model
+- enough remaining capacity units
+- enough worker slots
+- enough simulated VRAM and related admission constraints
+
+### Deficit Round Robin
+
+ForgeGPU now uses internal band buffers in the coordinator and applies an explainable Deficit Round Robin style pull policy before machine assignment.
+
+Current implementation direction:
+- bands accumulate scheduling credit
+- a selected job spends credit using its exact weight as the debit amount
+- the coordinator rotates across bands fairly rather than draining only the lightest lane first
+- after a job is selected fairly, machine assignment still uses best-fit eligible machine logic
+
+This fair scheduling layer is live today over internal band buffers. Kafka-aligned band ingress comes later as a transport change, not as the first fairness step.
+
+## Resource Estimation
+
+Resource estimation stays explicit and deterministic.
+
+The estimator combines:
+- exact weight
+- required memory
+- model family
+- simple explainable cost math
+
+The output is an effective cost in capacity units. Weight bands do not replace this math. They only provide ingress grouping. Exact weight and resource hints still drive real placement decisions.
+
+## Liveness, Heartbeat, and Availability
+
+ForgeGPU separates machine truth into three layers:
+- Postgres machine catalog: durable machine definitions
+- Redis live projection: fast shared runtime view
+- MachineActor memory: authoritative live execution ownership
+
+Machine actors publish heartbeats periodically. A stale heartbeat means the machine is unavailable for new assignment.
+
+Liveness states are interpreted as:
+- `Live`: heartbeat is current and actor is available
+- `Offline`: actor shut down gracefully and projected an offline state
+- `Stale`: heartbeat expired and the machine should be treated as unavailable
+- `Unavailable`: machine exists durably but is not schedulable because of actor or configuration state
+
+Important distinction:
+- actor stop does not mean durable machine deletion
+- Redis holds live projections; Postgres holds durable truth
+
+## Deferred, Retry, Dead-Letter, and Fallback Behavior
+
+When placement or execution fails, the job remains inspectable.
+
+1. If no machine is currently eligible, the coordinator defers the job and retries placement later.
+2. If execution times out, the job is classified explicitly and retry policy decides whether it is re-enqueued.
+3. If execution fails with a retryable error, the job is retried with fixed-delay semantics.
+4. If retries are exhausted or failure is non-retryable, the job becomes a terminal dead-lettered record.
+5. The job remains visible through durable job state and failure metadata.
+
+Current reliability model is already implemented. It is intentionally simple, explicit, and demo-friendly rather than pretending to be a full production failure orchestration layer.
+
+## Observability and Dashboard Direction
+
+### Visible today
+
+ForgeGPU already exposes live operational visibility through API surfaces:
+- `GET /metrics`
+- `GET /workers`
+- `GET /machines`
+- `GET /jobs/{id}`
+- `GET /jobs/dead-letter`
+
+These surfaces show:
+- queue and deferred depth
+- band buffer depth and fair-share credits
+- machine utilization and liveness
+- worker-style execution view
+- batch activity
+- retry and dead-letter behavior
+- latency summaries
+
+### Planned dashboard
+
+A full operator dashboard is not implemented yet.
+
+The target operator dashboard is expected to show:
+- ingress and resource band depths
+- machine cards with live utilization
+- scheduler decision stream
+- fairness summary
+- utilization summary
+- deferred job visibility
+
+## Load and Performance
+
+ForgeGPU includes `k6` scenarios to demonstrate behavior under concurrent traffic.
+
+Current scenarios:
+- `basic`: baseline submit + poll throughput and latency
+- `batch`: compatible traffic that demonstrates worker-side batching effectiveness
+- `constrained`: capacity pressure that demonstrates deferred behavior and non-placement paths
+- `reliability`: mixed success, retry, timeout, and dead-letter behavior under load
+
+These are intended to demonstrate architecture behavior, not just benchmark vanity numbers.
+
+## Example End-to-End Flow
+
+Example job:
+- prompt: `generate summary`
+- model: `gpt-sim-a`
+- weight: `21`
+- weight band: `W21_40`
+- required memory: `4096 MB`
+
+Possible flow:
+1. API writes the durable job row to Postgres.
+2. The job id is pushed to Redis ingress.
+3. CoordinatorActor classifies it into `W21_40`.
+4. The fair-share layer selects that band when it has enough credit.
+5. Best-fit machine selection picks a live eligible machine with enough remaining capacity and VRAM.
+6. MachineActor reserves resources and may batch it with compatible work.
+7. The job completes, retries on a retryable failure, or becomes dead-lettered if retries are exhausted.
+
+## Not in Scope Yet
+
+The following are intentionally not fully implemented yet:
+- Kafka ingress migration
+- final dashboard UI
+- distributed actor runtime or failover
+- real GPU telemetry
+- adaptive data-driven scheduling
+- advanced multi-tenant policy layers
+- production-grade durable deferred queue semantics
+
+## Run the System
 
 ```bash
 cp .env.example .env
-docker compose up --build
-```
-
-## Load Testing Prerequisites
-
-- `docker compose`
-- `dotnet`
-- optional local `k6`
-
-If `k6` is not installed locally, `./scripts/forgegpu.sh load ...` falls back to the `grafana/k6` Docker image.
-
-## Quick Validation
-
-```bash
-# health
-curl http://localhost:8080/health
-
-# workers snapshot
-curl http://localhost:8080/workers
-
-# system metrics snapshot
-curl http://localhost:8080/metrics
-
-# submit one successful job
-curl -X POST http://localhost:8080/jobs -H "Content-Type: application/json" -d '{"prompt":"phase7-success","model":"gpt-sim-a","requiredMemoryMb":2048,"weight":100}'
-
-# submit a retryable failure that succeeds on the second attempt
-curl -X POST http://localhost:8080/jobs -H "Content-Type: application/json" -d '{"prompt":"phase7-fail-retry-once","model":"gpt-sim-b","requiredMemoryMb":4096,"weight":100}'
-
-# submit a timeout path that eventually dead-letters
-curl -X POST http://localhost:8080/jobs -H "Content-Type: application/json" -d '{"prompt":"phase7-slow-timeout","model":"gpt-sim-mix","requiredMemoryMb":4096,"weight":100}'
-
-# submit a retry-exhausted execution failure
-curl -X POST http://localhost:8080/jobs -H "Content-Type: application/json" -d '{"prompt":"phase7-fail-always","model":"gpt-sim-b","requiredMemoryMb":4096,"weight":100}'
-
-# inspect dead-letter jobs
-curl http://localhost:8080/jobs/dead-letter
-
-# inspect persisted jobs
-docker compose exec -T forgegpu-postgres \
-  psql -U forgegpu -d forgegpu -c "SELECT prompt, status, retry_count, last_failure_category FROM inference_jobs ORDER BY created_at_utc DESC LIMIT 10;"
-```
-
-## Performance Testing
-
-Start the stack:
-
-```bash
 ./scripts/forgegpu.sh up --build --detach
 ./scripts/forgegpu.sh health
 ```
 
-Run scenarios:
+Key endpoints:
+- `POST /jobs`
+- `GET /jobs/{id}`
+- `GET /jobs/dead-letter`
+- `GET /metrics`
+- `GET /workers`
+- `GET /machines`
+- `GET /health`
+
+## Example API Calls
+
+Submit a job:
 
 ```bash
-# basic concurrent submit + poll
+curl -X POST http://localhost:8080/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "run simulation",
+    "model": "gpt-sim-b",
+    "weight": 21,
+    "requiredMemoryMb": 8192
+  }'
+```
+
+Inspect a job:
+
+```bash
+curl http://localhost:8080/jobs/<job-id>
+```
+
+Inspect live system state:
+
+```bash
+curl http://localhost:8080/metrics
+curl http://localhost:8080/workers
+curl http://localhost:8080/machines
+```
+
+Run load scenarios:
+
+```bash
 ./scripts/forgegpu.sh load basic --vus 6 --iterations 24
-
-# batch-heavy scenario
 ./scripts/forgegpu.sh load batch --vus 8 --iterations 32 --model gpt-sim-a --required-memory 1024
-
-# constrained-capacity scenario
 ./scripts/forgegpu.sh load constrained --vus 6 --iterations 18 --model gpt-sim-b --required-memory 14000 --poll-timeout-ms 12000
-
-# reliability mix scenario
 ./scripts/forgegpu.sh load reliability --vus 6 --iterations 20 --poll-timeout-ms 90000
 ```
 
-For isolated comparisons, reset the stack between runs so Postgres state and in-memory metrics start clean:
+## Target Architecture Direction
 
-```bash
-./scripts/forgegpu.sh reset --yes --rebuild --up
-```
+ForgeGPU is moving toward a tighter alignment between ingress grouping, fairness, and machine-aware assignment.
 
-Useful inspection points after each run:
+Planned next steps:
+- Kafka ingress migration using coarse band topics
+- richer fairness controls across ingress bands
+- stronger operator dashboard visibility
+- continued refinement of actor-oriented ownership and explainable scheduling
 
-```bash
-./scripts/forgegpu.sh metrics
-./scripts/forgegpu.sh workers
-curl http://localhost:8080/jobs/dead-letter
-```
-
-Optional comparison:
-
-```bash
-# run batch-heavy with batching enabled
-./scripts/forgegpu.sh load batch --vus 8 --iterations 32
-
-# run again with batching disabled for comparison
-BATCHING_ENABLED=false ./scripts/forgegpu.sh reset --yes --rebuild --up
-./scripts/forgegpu.sh load batch --vus 8 --iterations 32
-```
-
-The k6 scenario summary reports:
-
-- iteration and HTTP request rates
-- completed / failed / dead-lettered counts
-- observed retries and deferred pressure
-- average and p95 end-to-end latency
-- queue wait and execution latency
-- end-of-run ForgeGPU `/metrics` and `/workers` snapshots in the log output
-
-## Not In Scope Yet
-
-- Kafka
-- distributed lease/claim semantics
-- real GPU telemetry integration
-- external metrics/exporter stack
+The core direction remains stable:
+- coarse bands for ingress grouping
+- exact weight for scheduling decisions
+- central coordinator ownership for assignment
+- machine actor ownership for live execution state

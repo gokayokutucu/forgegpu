@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
 using ForgeGPU.Core.InferenceJobs;
+using ForgeGPU.Core.InferenceMachines;
 using ForgeGPU.Core.InferenceWorkers;
 using ForgeGPU.Core.Observability;
 using ForgeGPU.Infrastructure.Configuration;
@@ -11,28 +12,37 @@ using StackExchange.Redis;
 
 namespace ForgeGPU.Infrastructure.Workers;
 
-public sealed class InferenceOrchestrationService : BackgroundService, IWorkerStateReader, IOrchestrationTelemetry
+public sealed class InferenceOrchestrationService : BackgroundService, IWorkerStateReader, IMachineStateReader, IOrchestrationTelemetry
 {
     private const int RecentWindowSize = 20;
 
     private readonly IJobQueue _jobQueue;
     private readonly IJobStore _jobStore;
-    private readonly IWorkerScheduler _workerScheduler;
+    private readonly IMachineScheduler _machineScheduler;
+    private readonly IResourceEstimator _resourceEstimator;
+    private readonly IMachineCatalogStore _machineCatalogStore;
+    private readonly IMachineLiveProjectionStore _machineLiveProjectionStore;
     private readonly IConnectionMultiplexer _redis;
     private readonly ILogger<InferenceOrchestrationService> _logger;
     private readonly InfrastructureOptions _options;
-    private readonly ConcurrentDictionary<string, WorkerNode> _workers = new(StringComparer.Ordinal);
-
+    private readonly ConcurrentDictionary<string, MachineActor> _machines = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, MachineLivenessState> _machineLivenessStates = new(StringComparer.Ordinal);
     private readonly Queue<DeferredJob> _pendingJobs = new();
     private readonly object _pendingJobsLock = new();
     private readonly ConcurrentDictionary<Guid, RetryJob> _retryJobs = new();
+    private readonly ConcurrentDictionary<Guid, DateTime> _deferredLogTimestamps = new();
     private readonly object _metricsLock = new();
+    private readonly ConcurrentDictionary<string, int> _acceptedByWeightBand = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> _completedByWeightBand = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _completedByModel = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _batchesByModel = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> _deferredByWeightBand = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> _dispatchesByWeightBand = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _deferralReasons = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _failureCategories = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<int> _recentBatchSizes = new();
     private readonly Queue<LatencySample> _recentLatencies = new();
+    private readonly CoordinatorActor _coordinator;
 
     private long _totalJobsAccepted;
     private long _totalJobsCompleted;
@@ -56,25 +66,35 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
     public InferenceOrchestrationService(
         IJobQueue jobQueue,
         IJobStore jobStore,
-        IWorkerScheduler workerScheduler,
+        IMachineScheduler machineScheduler,
+        IResourceEstimator resourceEstimator,
+        IMachineCatalogStore machineCatalogStore,
+        IMachineLiveProjectionStore machineLiveProjectionStore,
         IConnectionMultiplexer redis,
         IOptions<InfrastructureOptions> options,
         ILogger<InferenceOrchestrationService> logger)
     {
         _jobQueue = jobQueue;
         _jobStore = jobStore;
-        _workerScheduler = workerScheduler;
+        _machineScheduler = machineScheduler;
+        _resourceEstimator = resourceEstimator;
+        _machineCatalogStore = machineCatalogStore;
+        _machineLiveProjectionStore = machineLiveProjectionStore;
         _redis = redis;
         _logger = logger;
         _options = options.Value;
+        _coordinator = new CoordinatorActor(this);
+    }
 
-        InitializeWorkers();
+    public async Task<IReadOnlyCollection<MachineState>> GetMachinesAsync(CancellationToken cancellationToken)
+    {
+        return await LoadMachineStatesAsync(cancellationToken, logLivenessTransitions: false);
     }
 
     public IReadOnlyCollection<WorkerState> GetWorkers()
     {
-        return _workers.Values
-            .Select(x => x.ToState())
+        return _machines.Values
+            .Select(actor => actor.ToWorkerState())
             .OrderBy(x => x.WorkerId, StringComparer.Ordinal)
             .ToArray();
     }
@@ -83,7 +103,7 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
     {
         lock (_pendingJobsLock)
         {
-            return _pendingJobs.Count;
+            return _pendingJobs.Count + _retryJobs.Count;
         }
     }
 
@@ -92,27 +112,28 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         return _options.WorkerExecution.SchedulerPolicy;
     }
 
-    public void RecordJobAccepted(string model)
+    public void RecordJobAccepted(string model, WeightBand weightBand)
     {
         Interlocked.Increment(ref _totalJobsAccepted);
+        IncrementCounter(_acceptedByWeightBand, weightBand.ToString());
     }
 
-    public void RecordJobDeferred(string reason)
+    public void RecordJobDeferred(string reason, WeightBand weightBand)
     {
         Interlocked.Increment(ref _totalJobsDeferred);
         Interlocked.Increment(ref _schedulerDeferralCount);
         IncrementCounter(_deferralReasons, reason);
+        IncrementCounter(_deferredByWeightBand, weightBand.ToString());
     }
 
     public async ValueTask<OrchestrationMetricsSnapshot> GetSnapshotAsync(CancellationToken cancellationToken)
     {
-        var workers = GetWorkers();
-        var totalWorkers = workers.Count;
-        var activeJobs = workers.Sum(x => x.ActiveJobCount);
-        var jobCapacity = workers.Sum(x => x.MaxConcurrentJobs);
-        var reservedVramMb = workers.Sum(x => x.VramReservedMb);
-        var totalVramMb = workers.Sum(x => x.VramTotalMb);
-
+        var machines = await LoadMachineStatesAsync(cancellationToken, logLivenessTransitions: false);
+        var fairShareSnapshot = _coordinator.GetFairShareSnapshot();
+        var activeJobs = machines.Sum(x => x.ActiveJobCount);
+        var jobCapacity = machines.Sum(x => x.MaxParallelWorkers);
+        var reservedVramMb = machines.Sum(x => x.UsedGpuVramMb);
+        var totalVramMb = machines.Sum(x => x.GpuVramMb);
         var ingressQueueDepth = await GetIngressQueueDepthAsync(cancellationToken);
         var pendingReasons = GetPendingReasonCounts();
 
@@ -154,17 +175,23 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                 Volatile.Read(ref _deadLetterCount),
                 Volatile.Read(ref _totalJobsDeferred),
                 activeJobs,
+                SnapshotDictionary(_acceptedByWeightBand),
+                SnapshotDictionary(_completedByWeightBand),
+                SnapshotDictionary(_deferredByWeightBand),
                 SnapshotDictionary(_completedByModel),
                 SnapshotDictionary(_failureCategories)),
             new QueueMetricsSnapshot(
                 ingressQueueDepth,
-                GetPendingJobCount() + GetRetryPendingCount(),
+                GetPendingJobCount(),
+                fairShareSnapshot.BandBufferDepths,
                 pendingReasons),
             new SchedulerMetricsSnapshot(
                 _options.WorkerExecution.SchedulerPolicy,
                 Volatile.Read(ref _schedulerDecisionCount),
                 Volatile.Read(ref _schedulerSelectionCount),
                 Volatile.Read(ref _schedulerDeferralCount),
+                SnapshotDictionary(_dispatchesByWeightBand),
+                fairShareSnapshot.BandCredits,
                 SnapshotDictionary(_deferralReasons)),
             new BatchMetricsSnapshot(
                 totalBatchesFormed,
@@ -172,9 +199,9 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
                 recentAverageBatchSize,
                 SnapshotDictionary(_batchesByModel)),
             new WorkerUtilizationMetricsSnapshot(
-                totalWorkers,
-                workers.Count(x => x.Status is WorkerStatus.Busy or WorkerStatus.Saturated),
-                workers.Count(x => x.Status == WorkerStatus.Saturated),
+                machines.Count,
+                machines.Count(x => x.Status is MachineStatus.Busy or MachineStatus.Saturated),
+                machines.Count(x => x.Status == MachineStatus.Saturated),
                 activeJobs,
                 jobCapacity,
                 jobCapacity == 0 ? 0 : Math.Round((double)activeJobs / jobCapacity * 100, 2),
@@ -193,9 +220,11 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await InitializeMachinesAsync(stoppingToken);
+
         _logger.LogInformation(
-            "Inference orchestration started. WorkerCount: {WorkerCount}. SchedulerPolicy: {SchedulerPolicy}. PendingRetryDelayMs: {PendingRetryDelayMs}. BatchingEnabled: {BatchingEnabled}. BatchWindowMs: {BatchWindowMs}. MaxBatchSize: {MaxBatchSize}. MaxBatchMemoryMb: {MaxBatchMemoryMb}. ExecutionTimeoutMs: {ExecutionTimeoutMs}. MaxRetries: {MaxRetries}. RetryDelayMs: {RetryDelayMs}.",
-            _workers.Count,
+            "Inference orchestration started. MachineCount: {MachineCount}. SchedulerPolicy: {SchedulerPolicy}. DeferredRetryDelayMs: {DeferredRetryDelayMs}. BatchingEnabled: {BatchingEnabled}. BatchWindowMs: {BatchWindowMs}. MaxBatchSize: {MaxBatchSize}. MaxBatchMemoryMb: {MaxBatchMemoryMb}. ExecutionTimeoutMs: {ExecutionTimeoutMs}. MaxRetries: {MaxRetries}. RetryDelayMs: {RetryDelayMs}. HeartbeatIntervalSeconds: {HeartbeatIntervalSeconds}. HeartbeatTtlSeconds: {HeartbeatTtlSeconds}.",
+            _machines.Count,
             _options.WorkerExecution.SchedulerPolicy,
             _options.Scheduling.DeferRetryDelayMs,
             _options.Batching.Enabled,
@@ -204,458 +233,50 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
             _options.Batching.MaxBatchMemoryMb,
             _options.Reliability.ExecutionTimeoutMs,
             _options.Reliability.MaxRetries,
-            _options.Reliability.RetryDelayMs);
+            _options.Reliability.RetryDelayMs,
+            _options.WorkerExecution.HeartbeatIntervalSeconds,
+            _options.WorkerExecution.HeartbeatTtlSeconds);
 
-        var workerTasks = _workers.Values
-            .Select(x => RunWorkerLoopAsync(x, stoppingToken))
+        var machineTasks = _machines.Values
+            .Select(machine => machine.RunAsync(stoppingToken))
             .ToArray();
 
         var heartbeatTask = RunHeartbeatLoopAsync(stoppingToken);
+        var coordinatorTask = _coordinator.RunAsync(stoppingToken);
 
         try
         {
-            await RunDispatcherLoopAsync(stoppingToken);
+            await Task.WhenAll(machineTasks.Append(heartbeatTask).Append(coordinatorTask));
+        }
+        catch (OperationCanceledException)
+        {
+            // Graceful shutdown.
         }
         finally
         {
-            try
-            {
-                await Task.WhenAll(workerTasks.Append(heartbeatTask));
-            }
-            catch (OperationCanceledException)
-            {
-                // Graceful shutdown cancellation.
-            }
-
+            await PublishOfflineAsync(CancellationToken.None);
             _logger.LogInformation("Inference orchestration stopped.");
         }
     }
 
-    private async Task RunDispatcherLoopAsync(CancellationToken cancellationToken)
+    public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            var jobId = await AcquireNextJobIdAsync(cancellationToken);
-            if (jobId is null)
-            {
-                continue;
-            }
-
-            var job = await _jobStore.GetAsync(jobId.Value, cancellationToken);
-            if (job is null)
-            {
-                _logger.LogWarning("Dispatcher received job {JobId} but it was not found in Postgres store.", jobId.Value);
-                continue;
-            }
-
-            var states = GetWorkers();
-            var decision = _workerScheduler.Evaluate(job, states);
-            Interlocked.Increment(ref _schedulerDecisionCount);
-
-            _logger.LogDebug(
-                "Scheduler evaluation for job {JobId}: {Evaluations}",
-                job.Id,
-                string.Join(", ", decision.Evaluations.Select(x => $"{x.WorkerId}={x.Reason}")));
-
-            if (decision.SelectedWorker is null)
-            {
-                DeferJob(job.Id, "NoEligibleWorker");
-                RecordJobDeferred("NoEligibleWorker");
-
-                _logger.LogWarning(
-                    "Deferred job {JobId}. Reason: no eligible worker. Model: {Model}. RequiredMemoryMb: {RequiredMemoryMb}. PendingJobs: {PendingJobs}.",
-                    job.Id,
-                    job.Model,
-                    job.RequiredMemoryMb,
-                    GetPendingJobCount());
-
-                continue;
-            }
-
-            if (!_workers.TryGetValue(decision.SelectedWorker.WorkerId, out var workerNode))
-            {
-                DeferJob(job.Id, "SelectedWorkerMissing");
-                RecordJobDeferred("SelectedWorkerMissing");
-                continue;
-            }
-
-            if (!workerNode.TryReserve(job, out var reservationFailureReason))
-            {
-                var reason = reservationFailureReason ?? "ReservationRejected";
-                DeferJob(job.Id, reason);
-                RecordJobDeferred(reason);
-
-                _logger.LogWarning(
-                    "Deferred job {JobId}. Worker {WorkerId} reservation failed. Reason: {Reason}. PendingJobs: {PendingJobs}.",
-                    job.Id,
-                    workerNode.WorkerId,
-                    reason,
-                    GetPendingJobCount());
-
-                continue;
-            }
-
-            try
-            {
-                await workerNode.Channel.Writer.WriteAsync(job.Id, cancellationToken);
-                Interlocked.Increment(ref _schedulerSelectionCount);
-
-                _logger.LogInformation(
-                    "Dispatched job {JobId} to worker {WorkerId}. Model: {Model}. RequiredMemoryMb: {RequiredMemoryMb}. WorkerVram: {VramReservedMb}/{VramTotalMb}. ActiveJobs: {ActiveJobCount}/{MaxConcurrentJobs}. RetryCount: {RetryCount}/{MaxRetries}.",
-                    job.Id,
-                    workerNode.WorkerId,
-                    job.Model,
-                    job.RequiredMemoryMb,
-                    workerNode.VramReservedMb,
-                    workerNode.VramTotalMb,
-                    workerNode.ActiveJobCount,
-                    workerNode.MaxConcurrentJobs,
-                    job.RetryCount,
-                    job.MaxRetries);
-            }
-            catch
-            {
-                workerNode.ReleaseReservation(job.Id);
-                throw;
-            }
-        }
+        await PublishOfflineAsync(cancellationToken);
+        await base.StopAsync(cancellationToken);
     }
 
-    private async Task<Guid?> AcquireNextJobIdAsync(CancellationToken cancellationToken)
+    private async Task InitializeMachinesAsync(CancellationToken cancellationToken)
     {
-        if (TryTakeReadyDeferred(out var deferred))
+        var machineCatalog = await _machineCatalogStore.ListAsync(cancellationToken);
+
+        _logger.LogInformation(
+            "Loaded durable machine catalog from Postgres. MachineCount: {MachineCount}.",
+            machineCatalog.Count);
+
+        foreach (var machine in machineCatalog)
         {
-            _logger.LogInformation("Dispatcher retrying deferred job {JobId}. PreviousReason: {Reason}.", deferred.JobId, deferred.Reason);
-            return deferred.JobId;
+            _machines[machine.MachineId] = new MachineActor(this, machine);
         }
-
-        try
-        {
-            var jobId = await _jobQueue.DequeueAsync(cancellationToken);
-
-            _logger.LogInformation("Dequeued job {JobId} from ingress queue.", jobId);
-            return jobId;
-        }
-        catch (OperationCanceledException)
-        {
-            return null;
-        }
-    }
-
-    private async Task RunWorkerLoopAsync(WorkerNode workerNode, CancellationToken cancellationToken)
-    {
-        var reader = workerNode.Channel.Reader;
-        var bufferedJobIds = new Queue<Guid>();
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            Guid jobId;
-
-            if (bufferedJobIds.Count > 0)
-            {
-                jobId = bufferedJobIds.Dequeue();
-            }
-            else
-            {
-                try
-                {
-                    jobId = await reader.ReadAsync(cancellationToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-            }
-
-            await ProcessBatchAsync(workerNode, reader, jobId, bufferedJobIds, cancellationToken);
-        }
-    }
-
-    private async Task ProcessBatchAsync(
-        WorkerNode workerNode,
-        ChannelReader<Guid> reader,
-        Guid firstJobId,
-        Queue<Guid> bufferedJobIds,
-        CancellationToken cancellationToken)
-    {
-        workerNode.UpdateHeartbeat();
-
-        var batch = new List<InferenceJob>();
-        var batchModel = string.Empty;
-        var batchMemoryMb = 0;
-
-        try
-        {
-            var firstJob = await _jobStore.GetAsync(firstJobId, cancellationToken);
-            if (firstJob is null)
-            {
-                _logger.LogWarning(
-                    "Worker {WorkerId} received job {JobId} but it no longer exists in Postgres store.",
-                    workerNode.WorkerId,
-                    firstJobId);
-                workerNode.ReleaseReservation(firstJobId);
-                return;
-            }
-
-            batch.Add(firstJob);
-            batchModel = firstJob.Model ?? string.Empty;
-            batchMemoryMb = firstJob.RequiredMemoryMb;
-
-            var batchWindow = _options.Batching.Enabled
-                ? TimeSpan.FromMilliseconds(Math.Max(0, _options.Batching.BatchWindowMs))
-                : TimeSpan.Zero;
-            var deadlineUtc = DateTime.UtcNow.Add(batchWindow);
-
-            while (_options.Batching.Enabled && batch.Count < Math.Max(1, _options.Batching.MaxBatchSize))
-            {
-                if (DateTime.UtcNow >= deadlineUtc)
-                {
-                    break;
-                }
-
-                var nextJobId = await TryReadNextCandidateAsync(reader, bufferedJobIds, deadlineUtc, cancellationToken);
-                if (nextJobId is null)
-                {
-                    break;
-                }
-
-                var nextJob = await _jobStore.GetAsync(nextJobId.Value, cancellationToken);
-                if (nextJob is null)
-                {
-                    _logger.LogWarning(
-                        "Worker {WorkerId} skipped missing queued job {JobId} during batch assembly.",
-                        workerNode.WorkerId,
-                        nextJobId.Value);
-                    workerNode.ReleaseReservation(nextJobId.Value);
-                    continue;
-                }
-
-                if (!CanJoinBatch(batchModel, batchMemoryMb, nextJob))
-                {
-                    bufferedJobIds.Enqueue(nextJob.Id);
-                    break;
-                }
-
-                batch.Add(nextJob);
-                batchMemoryMb += nextJob.RequiredMemoryMb;
-            }
-
-            workerNode.StartBatch(batch);
-            RecordBatchFormed(batchModel, batch.Count);
-
-            _logger.LogInformation(
-                "Worker {WorkerId} formed batch. BatchSize: {BatchSize}. Model: {Model}. BatchMemoryMb: {BatchMemoryMb}. ReservedVram: {VramReservedMb}/{VramTotalMb}.",
-                workerNode.WorkerId,
-                batch.Count,
-                batchModel,
-                batchMemoryMb,
-                workerNode.VramReservedMb,
-                workerNode.VramTotalMb);
-
-            var startedAtUtc = DateTime.UtcNow;
-            foreach (var job in batch)
-            {
-                job.MarkProcessing(startedAtUtc);
-                await _jobStore.UpdateAsync(job, cancellationToken);
-            }
-
-            using var executionSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            executionSource.CancelAfter(Math.Max(250, _options.Reliability.ExecutionTimeoutMs));
-
-            await SimulateBatchExecutionAsync(batch, executionSource.Token);
-
-            foreach (var job in batch)
-            {
-                job.MarkCompleted($"Simulated response for prompt: {job.Prompt}", DateTime.UtcNow);
-                await _jobStore.UpdateAsync(job, cancellationToken);
-                workerNode.MarkJobCompleted();
-                RecordJobFinalized(job, job.Model ?? "unknown", succeeded: true, failureCategory: null, terminal: false);
-
-                var latency = BuildLatencySample(job);
-                _logger.LogInformation(
-                    "Worker {WorkerId} completed job {JobId} in batch. BatchSize: {BatchSize}. QueueWaitMs: {QueueWaitMs}. ExecutionMs: {ExecutionMs}. TotalLatencyMs: {TotalLatencyMs}.",
-                    workerNode.WorkerId,
-                    job.Id,
-                    batch.Count,
-                    latency.QueueWaitMs,
-                    latency.ExecutionMs,
-                    latency.TotalLatencyMs);
-            }
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            await HandleBatchFailureAsync(
-                workerNode,
-                batch,
-                JobFailureCategory.Timeout,
-                "Execution timed out before the batch completed.",
-                CancellationToken.None);
-        }
-        catch (NonRetryableExecutionException ex)
-        {
-            await HandleBatchFailureAsync(
-                workerNode,
-                batch,
-                JobFailureCategory.NonRetryableError,
-                ex.Message,
-                CancellationToken.None);
-        }
-        catch (Exception ex)
-        {
-            await HandleBatchFailureAsync(
-                workerNode,
-                batch,
-                JobFailureCategory.ExecutionError,
-                ex.Message,
-                CancellationToken.None);
-        }
-        finally
-        {
-            workerNode.CompleteBatch(batch);
-            workerNode.UpdateHeartbeat();
-
-            _logger.LogInformation(
-                "Worker {WorkerId} released batch resources. BatchSize: {BatchSize}. ActiveJobs: {ActiveJobCount}/{MaxConcurrentJobs}. Vram: {VramReservedMb}/{VramTotalMb}. TotalBatchesFormed: {TotalBatchesFormed}.",
-                workerNode.WorkerId,
-                batch.Count,
-                workerNode.ActiveJobCount,
-                workerNode.MaxConcurrentJobs,
-                workerNode.VramReservedMb,
-                workerNode.VramTotalMb,
-                workerNode.TotalBatchesFormed);
-        }
-    }
-
-    private async Task HandleBatchFailureAsync(
-        WorkerNode workerNode,
-        IReadOnlyCollection<InferenceJob> batch,
-        JobFailureCategory category,
-        string failureReason,
-        CancellationToken cancellationToken)
-    {
-        foreach (var job in batch)
-        {
-            var timestampUtc = DateTime.UtcNow;
-
-            if (category == JobFailureCategory.Timeout)
-            {
-                Interlocked.Increment(ref _totalJobsTimedOut);
-            }
-
-            if (IsRetryable(category) && job.CanRetry())
-            {
-                job.MarkRetrying(failureReason, category, timestampUtc);
-                await _jobStore.UpdateAsync(job, cancellationToken);
-                EnqueueRetry(job, category);
-
-                workerNode.MarkJobRetried();
-                RecordJobRetried(category);
-
-                _logger.LogWarning(
-                    "Worker {WorkerId} scheduled retry for job {JobId}. FailureCategory: {FailureCategory}. Attempt: {RetryCount}/{MaxRetries}. RetryDelayMs: {RetryDelayMs}.",
-                    workerNode.WorkerId,
-                    job.Id,
-                    category,
-                    job.RetryCount,
-                    job.MaxRetries,
-                    _options.Reliability.RetryDelayMs);
-
-                continue;
-            }
-
-            var terminalReason = IsRetryable(category) && !job.CanRetry()
-                ? $"Retry exhausted after {category}: {failureReason}"
-                : failureReason;
-
-            var terminalCategory = IsRetryable(category) && !job.CanRetry()
-                ? JobFailureCategory.RetryExhausted
-                : category;
-
-            job.MarkDeadLettered(terminalReason, terminalCategory, timestampUtc);
-            await _jobStore.UpdateAsync(job, cancellationToken);
-            workerNode.MarkJobFailed();
-            RecordJobFinalized(job, job.Model ?? "unknown", succeeded: false, failureCategory: terminalCategory, terminal: true);
-
-            if (terminalCategory == JobFailureCategory.RetryExhausted)
-            {
-                Interlocked.Increment(ref _retryExhaustedCount);
-            }
-
-            _logger.LogError(
-                "Worker {WorkerId} moved job {JobId} to dead letter. FailureCategory: {FailureCategory}. RetryCount: {RetryCount}/{MaxRetries}.",
-                workerNode.WorkerId,
-                job.Id,
-                terminalCategory,
-                job.RetryCount,
-                job.MaxRetries);
-        }
-    }
-
-    private async Task SimulateBatchExecutionAsync(IReadOnlyCollection<InferenceJob> batch, CancellationToken cancellationToken)
-    {
-        if (batch.Any(job => PromptContains(job, "fail-terminal")))
-        {
-            throw new NonRetryableExecutionException("Simulated non-retryable execution error.");
-        }
-
-        if (batch.Any(job => PromptContains(job, "fail-always")))
-        {
-            throw new InvalidOperationException("Simulated retryable execution failure.");
-        }
-
-        if (batch.Any(job => PromptContains(job, "fail-retry-once") && job.RetryCount == 0))
-        {
-            throw new InvalidOperationException("Simulated retryable execution failure on first attempt.");
-        }
-
-        var delayMs = Random.Shared.Next(1500, 2501) + ((batch.Count - 1) * 150);
-        if (batch.Any(job => PromptContains(job, "slow-timeout")))
-        {
-            delayMs = Math.Max(delayMs, _options.Reliability.ExecutionTimeoutMs + 500);
-        }
-
-        await Task.Delay(delayMs, cancellationToken);
-    }
-
-    private async Task<Guid?> TryReadNextCandidateAsync(
-        ChannelReader<Guid> reader,
-        Queue<Guid> bufferedJobIds,
-        DateTime deadlineUtc,
-        CancellationToken cancellationToken)
-    {
-        if (bufferedJobIds.Count > 0)
-        {
-            return bufferedJobIds.Dequeue();
-        }
-
-        var remaining = deadlineUtc - DateTime.UtcNow;
-        if (remaining <= TimeSpan.Zero)
-        {
-            return null;
-        }
-
-        using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        linkedSource.CancelAfter(remaining);
-
-        try
-        {
-            return await reader.ReadAsync(linkedSource.Token);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            return null;
-        }
-    }
-
-    private bool CanJoinBatch(string batchModel, int batchMemoryMb, InferenceJob nextJob)
-    {
-        if (!string.Equals(batchModel, nextJob.Model, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        var maxBatchMemoryMb = Math.Max(1, _options.Batching.MaxBatchMemoryMb);
-        return batchMemoryMb + nextJob.RequiredMemoryMb <= maxBatchMemoryMb;
     }
 
     private async Task RunHeartbeatLoopAsync(CancellationToken cancellationToken)
@@ -664,68 +285,181 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            foreach (var worker in _workers.Values)
+            foreach (var machine in _machines.Values)
             {
-                worker.UpdateHeartbeat();
+                await machine.PublishHeartbeatAsync(cancellationToken);
             }
 
             await Task.Delay(interval, cancellationToken);
         }
     }
 
-    private void InitializeWorkers()
+    private async Task<IReadOnlyCollection<MachineState>> LoadMachineStatesAsync(
+        CancellationToken cancellationToken,
+        bool logLivenessTransitions)
     {
-        var definitions = ResolveWorkerDefinitions();
+        var catalog = await _machineCatalogStore.ListAsync(cancellationToken);
+        var projections = await _machineLiveProjectionStore.GetManyAsync(catalog.Select(x => x.MachineId).ToArray(), cancellationToken);
+        var actorSummaries = _machines.Values.ToDictionary(x => x.MachineId, x => x.GetSummary(), StringComparer.Ordinal);
+        var machineStates = new List<MachineState>(catalog.Count);
 
-        foreach (var definition in definitions)
+        foreach (var entry in catalog.OrderBy(x => x.MachineId, StringComparer.Ordinal))
         {
-            _workers[definition.WorkerId] = new WorkerNode(
-                definition.WorkerId,
-                definition.Name,
-                definition.GpuId,
-                definition.MaxConcurrentJobs,
-                definition.VramTotalMb,
-                definition.SupportedModels);
+            projections.TryGetValue(entry.MachineId, out var projection);
+            actorSummaries.TryGetValue(entry.MachineId, out var actorSummary);
+            var liveness = ResolveLiveness(entry.Enabled, projection);
+            var machineState = MergeMachineState(entry, projection, actorSummary, liveness);
+            machineStates.Add(machineState);
+
+            if (logLivenessTransitions)
+            {
+                LogLivenessTransition(machineState);
+            }
+        }
+
+        return machineStates;
+    }
+
+    private MachineState MergeMachineState(
+        MachineCatalogEntry entry,
+        MachineLiveProjection? projection,
+        MachineActorSummary? actorSummary,
+        MachineLivenessState liveness)
+    {
+        var usedCapacityUnits = projection?.UsedCapacityUnits ?? 0;
+        var usedGpuVramMb = projection?.ReservedVramMb ?? 0;
+        var activeJobCount = projection?.ActiveJobCount ?? 0;
+        var actorStatus = projection?.ActorStatus;
+        var runtimeStatus = projection?.RuntimeStatus ?? MachineStatus.Idle;
+        var runningJobIds = projection?.RunningJobIds ?? Array.Empty<Guid>();
+        var currentModel = projection?.CurrentModel;
+        var currentBatchSize = projection?.CurrentBatchSize ?? 0;
+        var isAvailable = entry.Enabled && liveness == MachineLivenessState.Live;
+
+        return new MachineState(
+            entry.MachineId,
+            entry.Name,
+            entry.Enabled,
+            entry.CreatedAtUtc,
+            entry.UpdatedAtUtc,
+            entry.TotalCapacityUnits,
+            usedCapacityUnits,
+            entry.CpuScore,
+            entry.RamMb,
+            entry.GpuVramMb,
+            usedGpuVramMb,
+            activeJobCount,
+            entry.MaxParallelWorkers,
+            projection?.LastHeartbeatUtc,
+            runtimeStatus,
+            actorStatus,
+            liveness,
+            isAvailable,
+            projection?.ActorInstanceId,
+            entry.SupportedModels,
+            runningJobIds,
+            currentModel,
+            currentBatchSize,
+            actorSummary?.TotalBatchesFormed ?? 0,
+            actorSummary?.LastBatchModel,
+            actorSummary?.LastBatchSize ?? 0,
+            actorSummary?.LastBatchCompletedUtc,
+            actorSummary?.CompletedJobCount ?? 0,
+            actorSummary?.FailedJobCount ?? 0);
+    }
+
+    private MachineLivenessState ResolveLiveness(bool enabled, MachineLiveProjection? projection)
+    {
+        if (!enabled)
+        {
+            return MachineLivenessState.Unavailable;
+        }
+
+        if (projection is null)
+        {
+            return MachineLivenessState.Unavailable;
+        }
+
+        if (projection.ActorStatus == MachineActorStatus.Offline)
+        {
+            return MachineLivenessState.Offline;
+        }
+
+        var stalenessThreshold = TimeSpan.FromSeconds(Math.Max(
+            _options.WorkerExecution.HeartbeatIntervalSeconds + 1,
+            _options.WorkerExecution.HeartbeatTtlSeconds));
+
+        if (DateTime.UtcNow - projection.LastHeartbeatUtc > stalenessThreshold)
+        {
+            return MachineLivenessState.Stale;
+        }
+
+        return MachineLivenessState.Live;
+    }
+
+    private void LogLivenessTransition(MachineState machineState)
+    {
+        var previous = _machineLivenessStates.AddOrUpdate(
+            machineState.MachineId,
+            machineState.LivenessState,
+            (_, oldValue) => oldValue);
+
+        if (previous == machineState.LivenessState)
+        {
+            return;
+        }
+
+        _machineLivenessStates[machineState.MachineId] = machineState.LivenessState;
+
+        _logger.LogInformation(
+            "Machine liveness transition detected. MachineId: {MachineId}. Previous: {PreviousLiveness}. Current: {CurrentLiveness}. Enabled: {Enabled}. ActorStatus: {ActorStatus}. LastHeartbeatUtc: {LastHeartbeatUtc}.",
+            machineState.MachineId,
+            previous,
+            machineState.LivenessState,
+            machineState.Enabled,
+            machineState.ActorStatus,
+            machineState.LastHeartbeatUtc);
+    }
+
+    private async Task<InferenceJob?> GetJobAsync(Guid jobId, CancellationToken cancellationToken)
+    {
+        return await _jobStore.GetAsync(jobId, cancellationToken);
+    }
+
+    private void RecordSchedulerDecision(MachineSchedulingDecision decision)
+    {
+        Interlocked.Increment(ref _schedulerDecisionCount);
+
+        if (decision.SelectedMachine is not null)
+        {
+            Interlocked.Increment(ref _schedulerSelectionCount);
         }
     }
 
-    private IReadOnlyCollection<WorkerDefinition> ResolveWorkerDefinitions()
+    private bool ShouldLogDeferred(Guid jobId)
     {
-        if (_options.WorkerExecution.Workers.Count > 0)
-        {
-            return _options.WorkerExecution.Workers
-                .Select(x => new WorkerDefinition
-                {
-                    WorkerId = x.WorkerId,
-                    Name = x.Name,
-                    GpuId = x.GpuId,
-                    MaxConcurrentJobs = Math.Max(1, x.MaxConcurrentJobs),
-                    VramTotalMb = Math.Max(2048, x.VramTotalMb),
-                    SupportedModels = x.SupportedModels
-                })
-                .ToArray();
-        }
+        var now = DateTime.UtcNow;
+        var shouldLog = false;
 
-        var workerCount = Math.Max(1, _options.WorkerExecution.WorkerCount);
-        var defaultMaxConcurrent = Math.Max(1, _options.WorkerExecution.MaxConcurrentJobsPerWorker);
-        var supportedModels = _options.Scheduling.ModelDefaults.Select(x => x.Model).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-
-        var definitions = new List<WorkerDefinition>(workerCount);
-
-        for (var i = 1; i <= workerCount; i++)
-        {
-            definitions.Add(new WorkerDefinition
+        _deferredLogTimestamps.AddOrUpdate(
+            jobId,
+            _ =>
             {
-                WorkerId = $"worker-{i:00}",
-                Name = $"Inference Worker {i}",
-                GpuId = $"GPU-{i - 1}",
-                MaxConcurrentJobs = defaultMaxConcurrent,
-                VramTotalMb = 8192 + ((i - 1) * 4096),
-                SupportedModels = supportedModels
-            });
-        }
+                shouldLog = true;
+                return now;
+            },
+            (_, previous) =>
+            {
+                if (now - previous >= TimeSpan.FromSeconds(5))
+                {
+                    shouldLog = true;
+                    return now;
+                }
 
-        return definitions;
+                return previous;
+            });
+
+        return shouldLog;
     }
 
     private void DeferJob(Guid jobId, string reason)
@@ -766,12 +500,43 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         var retryJob = new RetryJob(job.Id, retryAtUtc, category, job.RetryCount, job.MaxRetries);
         _retryJobs[job.Id] = retryJob;
 
-        _ = ScheduleRetryEnqueueAsync(retryJob);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(Math.Max(50, _options.Reliability.RetryDelayMs)));
+                await _jobQueue.EnqueueAsync(job.Id, CancellationToken.None);
+                _logger.LogInformation(
+                    "Re-enqueued retry job {JobId}. FailureCategory: {FailureCategory}. Attempt: {RetryCount}/{MaxRetries}.",
+                    job.Id,
+                    category,
+                    retryJob.RetryCount,
+                    retryJob.MaxRetries);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to re-enqueue retry job {JobId}.", job.Id);
+            }
+            finally
+            {
+                _retryJobs.TryRemove(job.Id, out _);
+            }
+        });
     }
 
-    private int GetRetryPendingCount()
+    private async Task PublishOfflineAsync(CancellationToken cancellationToken)
     {
-        return _retryJobs.Count;
+        foreach (var machine in _machines.Values)
+        {
+            try
+            {
+                await machine.PublishOfflineAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to publish offline state for machine {MachineId}.", machine.MachineId);
+            }
+        }
     }
 
     private async Task<long?> GetIngressQueueDepthAsync(CancellationToken cancellationToken)
@@ -835,6 +600,7 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         {
             Interlocked.Increment(ref _totalJobsCompleted);
             IncrementCounter(_completedByModel, model);
+            IncrementCounter(_completedByWeightBand, job.WeightBand.ToString());
         }
         else
         {
@@ -869,6 +635,11 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         }
     }
 
+    private void RecordBandDispatch(WeightBand weightBand)
+    {
+        IncrementCounter(_dispatchesByWeightBand, weightBand.ToString());
+    }
+
     private static LatencySample BuildLatencySample(InferenceJob job)
     {
         var queueWaitMs = job.StartedAtUtc.HasValue
@@ -901,270 +672,1045 @@ public sealed class InferenceOrchestrationService : BackgroundService, IWorkerSt
         counters.AddOrUpdate(key, 1, static (_, current) => current + 1);
     }
 
-    private async Task ScheduleRetryEnqueueAsync(RetryJob retryJob)
+    private static IReadOnlyDictionary<string, int> SnapshotDictionary(ConcurrentDictionary<string, int> counters)
     {
-        try
-        {
-            var delay = retryJob.RetryAfterUtc - DateTime.UtcNow;
-            if (delay > TimeSpan.Zero)
-            {
-                await Task.Delay(delay);
-            }
-
-            await _jobQueue.EnqueueAsync(retryJob.JobId, CancellationToken.None);
-            _logger.LogInformation(
-                "Re-enqueued retry job {JobId} to ingress queue. FailureCategory: {FailureCategory}. Attempt: {Attempt}/{MaxRetries}.",
-                retryJob.JobId,
-                retryJob.FailureCategory,
-                retryJob.RetryCount,
-                retryJob.MaxRetries);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(
-                ex,
-                "Failed to re-enqueue retry job {JobId}. FailureCategory: {FailureCategory}. Attempt: {Attempt}/{MaxRetries}.",
-                retryJob.JobId,
-                retryJob.FailureCategory,
-                retryJob.RetryCount,
-                retryJob.MaxRetries);
-        }
-        finally
-        {
-            _retryJobs.TryRemove(retryJob.JobId, out _);
-        }
-    }
-
-    private static IReadOnlyDictionary<string, int> SnapshotDictionary(ConcurrentDictionary<string, int> source)
-    {
-        return source
+        return counters
             .OrderByDescending(x => x.Value)
             .ThenBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(x => x.Key, x => x.Value, StringComparer.OrdinalIgnoreCase);
     }
 
-    private readonly record struct DeferredJob(Guid JobId, DateTime RetryAfterUtc, string Reason);
-    private readonly record struct RetryJob(Guid JobId, DateTime RetryAfterUtc, JobFailureCategory FailureCategory, int RetryCount, int MaxRetries);
-    private readonly record struct LatencySample(long QueueWaitMs, long ExecutionMs, long TotalLatencyMs);
-
-    private sealed class WorkerNode
+    private sealed class CoordinatorActor
     {
-        private readonly object _gate = new();
-        private readonly Dictionary<Guid, int> _jobMemoryReservations = new();
-        private readonly HashSet<string> _supportedModels;
-        private string? _currentModel;
+        private const int MaxSelectionRounds = 32;
 
-        private int _activeJobCount;
-        private int _vramReservedMb;
-        private long _lastHeartbeatUtcTicks;
+        private readonly InferenceOrchestrationService _owner;
+        private readonly SemaphoreSlim _bufferSignal = new(0);
+        private readonly object _bandLock = new();
+        private readonly WeightBand[] _bandOrder = Enum.GetValues<WeightBand>();
+        private readonly Dictionary<WeightBand, Queue<BufferedBandJob>> _bandBuffers;
+        private readonly Dictionary<WeightBand, int> _bandCredits;
+        private int _nextBandIndex;
+
+        public CoordinatorActor(InferenceOrchestrationService owner)
+        {
+            _owner = owner;
+            _bandBuffers = _bandOrder.ToDictionary(x => x, _ => new Queue<BufferedBandJob>());
+            _bandCredits = _bandOrder.ToDictionary(x => x, _ => 0);
+        }
+
+        public Task RunAsync(CancellationToken cancellationToken)
+        {
+            return Task.WhenAll(
+                RunIngressLoopAsync(cancellationToken),
+                RunReconciliationLoopAsync(cancellationToken),
+                RunAssignmentLoopAsync(cancellationToken));
+        }
+
+        public FairShareSnapshot GetFairShareSnapshot()
+        {
+            lock (_bandLock)
+            {
+                return new FairShareSnapshot(
+                    _bandOrder.ToDictionary(
+                        band => band.ToString(),
+                        band => _bandBuffers[band].Count,
+                        StringComparer.OrdinalIgnoreCase),
+                    _bandOrder.ToDictionary(
+                        band => band.ToString(),
+                        band => _bandCredits[band],
+                        StringComparer.OrdinalIgnoreCase));
+            }
+        }
+
+        private async Task RunIngressLoopAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    var jobId = await _owner._jobQueue.DequeueAsync(cancellationToken);
+                    _owner._logger.LogInformation("CoordinatorActor dequeued job {JobId} from ingress queue.", jobId);
+                    await BufferJobAsync(jobId, "IngressQueue", cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+
+        private async Task RunReconciliationLoopAsync(CancellationToken cancellationToken)
+        {
+            var interval = TimeSpan.FromMilliseconds(Math.Max(50, _owner._options.Scheduling.DeferRetryDelayMs));
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                while (_owner.TryTakeReadyDeferred(out var deferred))
+                {
+                    _owner._logger.LogDebug(
+                        "CoordinatorActor requeued deferred job {JobId}. PreviousReason: {Reason}.",
+                        deferred.JobId,
+                        deferred.Reason);
+
+                    await BufferJobAsync(deferred.JobId, "DeferredReconciliation", cancellationToken);
+                }
+
+                await Task.Delay(interval, cancellationToken);
+            }
+        }
+
+        private async Task RunAssignmentLoopAsync(CancellationToken cancellationToken)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                if (!TrySelectNextBufferedJob(out var bufferedJob, out var creditBeforeDebit, out var creditAfterDebit))
+                {
+                    if (GetPendingBufferedCount() == 0)
+                    {
+                        await _bufferSignal.WaitAsync(cancellationToken);
+                    }
+                    else
+                    {
+                        await Task.Delay(10, cancellationToken);
+                    }
+
+                    continue;
+                }
+
+                var job = await _owner.GetJobAsync(bufferedJob.JobId, cancellationToken);
+                if (job is null)
+                {
+                    _owner._logger.LogWarning(
+                        "CoordinatorActor received job {JobId}, but durable state was not found.",
+                        bufferedJob.JobId);
+                    continue;
+                }
+
+                var estimate = _owner._resourceEstimator.Estimate(job);
+                var machineStates = await _owner.LoadMachineStatesAsync(cancellationToken, logLivenessTransitions: true);
+                var decision = _owner._machineScheduler.Evaluate(job, estimate, machineStates);
+                _owner.RecordSchedulerDecision(decision);
+
+                var excludedByLiveness = decision.Evaluations
+                    .Where(x => x.Reason is "MachineOffline" or "MachineStale" or "MachineUnavailable" or "MachineDisabled")
+                    .ToArray();
+
+                if (excludedByLiveness.Length > 0)
+                {
+                    _owner._logger.LogDebug(
+                        "CoordinatorActor excluded machines for job {JobId} due to availability/liveness: {ExcludedMachines}.",
+                        job.Id,
+                        string.Join(", ", excludedByLiveness.Select(x => $"{x.MachineId}={x.Reason}")));
+                }
+
+                _owner._logger.LogInformation(
+                    "CoordinatorActor selected band {WeightBand} for job {JobId}. ExactWeightDebit: {ExactWeightDebit}. CreditBeforeDebit: {CreditBeforeDebit}. CreditAfterDebit: {CreditAfterDebit}. BufferedJobsRemainingInBand: {BufferedJobsRemainingInBand}.",
+                    bufferedJob.WeightBand,
+                    job.Id,
+                    job.Weight,
+                    creditBeforeDebit,
+                    creditAfterDebit,
+                    GetBufferedCount(bufferedJob.WeightBand));
+
+                _owner._logger.LogDebug(
+                    "CoordinatorActor evaluated job {JobId}. Estimate: {EffectiveCostUnits} units ({WeightBand}). Evaluations: {Evaluations}",
+                    job.Id,
+                    estimate.EffectiveCostUnits,
+                    estimate.WeightBand,
+                    string.Join(", ", decision.Evaluations.Select(x => $"{x.MachineId}={x.Reason}[cap:{x.RemainingCapacityUnits},vram:{x.RemainingGpuVramMb},slots:{x.AvailableWorkerSlots}]")));
+
+                if (decision.SelectedMachine is null)
+                {
+                    _owner.DeferJob(job.Id, "NoEligibleMachine");
+                    _owner.RecordJobDeferred("NoEligibleMachine", job.WeightBand);
+
+                    if (_owner.ShouldLogDeferred(job.Id))
+                    {
+                        _owner._logger.LogWarning(
+                            "CoordinatorActor deferred job {JobId}. WeightBand: {WeightBand}. Model: {Model}. RequiredMemoryMb: {RequiredMemoryMb}. EffectiveCostUnits: {EffectiveCostUnits}. PendingJobs: {PendingJobs}.",
+                            job.Id,
+                            job.WeightBand,
+                            job.Model,
+                            job.RequiredMemoryMb,
+                            estimate.EffectiveCostUnits,
+                            _owner.GetPendingJobCount());
+                    }
+
+                    continue;
+                }
+
+                if (!_owner._machines.TryGetValue(decision.SelectedMachine.MachineId, out var machine))
+                {
+                    _owner.DeferJob(job.Id, "SelectedMachineMissing");
+                    _owner.RecordJobDeferred("SelectedMachineMissing", job.WeightBand);
+                    continue;
+                }
+
+                if (!machine.TryAccept(job, estimate, out var rejectionReason))
+                {
+                    var reason = rejectionReason ?? "ReservationRejected";
+                    _owner.DeferJob(job.Id, reason);
+                    _owner.RecordJobDeferred(reason, job.WeightBand);
+
+                    if (_owner.ShouldLogDeferred(job.Id))
+                    {
+                        _owner._logger.LogWarning(
+                            "CoordinatorActor deferred job {JobId}. WeightBand: {WeightBand}. Machine {MachineId} rejected assignment. Reason: {Reason}. PendingJobs: {PendingJobs}.",
+                            job.Id,
+                            job.WeightBand,
+                            machine.MachineId,
+                            reason,
+                            _owner.GetPendingJobCount());
+                    }
+
+                    continue;
+                }
+
+                await machine.EnqueueAsync(new MachineAssignment(job.Id, estimate), cancellationToken);
+
+                _owner._logger.LogInformation(
+                    "CoordinatorActor assigned job {JobId} to machine {MachineId}. EffectiveCostUnits: {EffectiveCostUnits}. WeightBand: {WeightBand}. MachineCapacity: {UsedCapacityUnits}/{TotalCapacityUnits}. ActiveJobs: {ActiveJobCount}/{MaxParallelWorkers}.",
+                    job.Id,
+                    machine.MachineId,
+                    estimate.EffectiveCostUnits,
+                    estimate.WeightBand,
+                    machine.UsedCapacityUnits,
+                    machine.TotalCapacityUnits,
+                    machine.ActiveJobCount,
+                    machine.MaxParallelWorkers);
+
+                _owner.RecordBandDispatch(bufferedJob.WeightBand);
+            }
+        }
+
+        private async Task BufferJobAsync(Guid jobId, string source, CancellationToken cancellationToken)
+        {
+            var job = await _owner.GetJobAsync(jobId, cancellationToken);
+            if (job is null)
+            {
+                _owner._logger.LogWarning(
+                    "CoordinatorActor could not buffer job {JobId} from {Source} because durable state was missing.",
+                    jobId,
+                    source);
+                return;
+            }
+
+            lock (_bandLock)
+            {
+                _bandBuffers[job.WeightBand].Enqueue(new BufferedBandJob(job.Id, job.WeightBand, job.Weight));
+            }
+
+            _bufferSignal.Release();
+
+            _owner._logger.LogDebug(
+                "CoordinatorActor buffered job {JobId} into band {WeightBand} from {Source}. ExactWeight: {ExactWeight}. BandDepth: {BandDepth}.",
+                job.Id,
+                job.WeightBand,
+                source,
+                job.Weight,
+                GetBufferedCount(job.WeightBand));
+        }
+
+        private bool TrySelectNextBufferedJob(
+            out BufferedBandJob bufferedJob,
+            out int creditBeforeDebit,
+            out int creditAfterDebit)
+        {
+            lock (_bandLock)
+            {
+                bufferedJob = default;
+                creditBeforeDebit = 0;
+                creditAfterDebit = 0;
+
+                if (_bandBuffers.Values.All(queue => queue.Count == 0))
+                {
+                    return false;
+                }
+
+                for (var round = 0; round < MaxSelectionRounds; round++)
+                {
+                    for (var i = 0; i < _bandOrder.Length; i++)
+                    {
+                        var band = _bandOrder[_nextBandIndex];
+                        _nextBandIndex = (_nextBandIndex + 1) % _bandOrder.Length;
+
+                        var queue = _bandBuffers[band];
+                        if (queue.Count == 0)
+                        {
+                            continue;
+                        }
+
+                        _bandCredits[band] += GetQuantum(band);
+                        var candidate = queue.Peek();
+
+                        if (_bandCredits[band] < candidate.ExactWeight)
+                        {
+                            continue;
+                        }
+
+                        queue.Dequeue();
+                        creditBeforeDebit = _bandCredits[band];
+                        _bandCredits[band] -= candidate.ExactWeight;
+                        creditAfterDebit = _bandCredits[band];
+                        bufferedJob = candidate;
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+
+        private int GetPendingBufferedCount()
+        {
+            lock (_bandLock)
+            {
+                return _bandBuffers.Values.Sum(queue => queue.Count);
+            }
+        }
+
+        private int GetBufferedCount(WeightBand band)
+        {
+            lock (_bandLock)
+            {
+                return _bandBuffers[band].Count;
+            }
+        }
+
+        private static int GetQuantum(WeightBand band)
+        {
+            return band switch
+            {
+                WeightBand.W1_2 => 2,
+                WeightBand.W3_5 => 5,
+                WeightBand.W6_10 => 10,
+                WeightBand.W11_20 => 20,
+                WeightBand.W21_40 => 40,
+                WeightBand.W41Plus => 60,
+                _ => 10
+            };
+        }
+
+        private readonly record struct BufferedBandJob(Guid JobId, WeightBand WeightBand, int ExactWeight);
+    }
+
+    private sealed class MachineActor
+    {
+        private readonly InferenceOrchestrationService _owner;
+        private readonly object _sync = new();
+        private readonly Channel<MachineAssignment> _mailbox = Channel.CreateUnbounded<MachineAssignment>();
+        private readonly Dictionary<Guid, ReservedJob> _reservedJobs = new();
+        private readonly string[] _supportedModels;
+        private readonly string _actorInstanceId = $"actor-{Guid.NewGuid():N}";
+        private readonly string _machineName;
+        private readonly bool _enabled;
+        private DateTime _lastHeartbeatUtc = DateTime.UtcNow;
         private int _currentBatchSize;
         private int _totalBatchesFormed;
         private string? _lastBatchModel;
         private int _lastBatchSize;
-        private long _lastBatchCompletedUtcTicks;
+        private DateTime? _lastBatchCompletedUtc;
         private int _completedJobCount;
         private int _failedJobCount;
+        private readonly Dictionary<string, int> _executingModels = new(StringComparer.OrdinalIgnoreCase);
+        private MachineActorStatus _actorStatus = MachineActorStatus.Starting;
 
-        public WorkerNode(
-            string workerId,
-            string name,
-            string gpuId,
-            int maxConcurrentJobs,
-            int vramTotalMb,
-            IReadOnlyCollection<string> supportedModels)
+        public MachineActor(InferenceOrchestrationService owner, MachineCatalogEntry catalogEntry)
         {
-            WorkerId = workerId;
-            Name = name;
-            GpuId = gpuId;
-            MaxConcurrentJobs = maxConcurrentJobs;
-            VramTotalMb = vramTotalMb;
-            _supportedModels = supportedModels.ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-            Channel = System.Threading.Channels.Channel.CreateUnbounded<Guid>(new UnboundedChannelOptions
-            {
-                SingleReader = true,
-                SingleWriter = false,
-                AllowSynchronousContinuations = false
-            });
-
-            _lastHeartbeatUtcTicks = DateTime.UtcNow.Ticks;
+            _owner = owner;
+            MachineId = catalogEntry.MachineId;
+            _machineName = catalogEntry.Name;
+            _enabled = catalogEntry.Enabled;
+            TotalCapacityUnits = catalogEntry.TotalCapacityUnits;
+            CpuScore = catalogEntry.CpuScore;
+            RamMb = catalogEntry.RamMb;
+            GpuVramMb = catalogEntry.GpuVramMb;
+            MaxParallelWorkers = catalogEntry.MaxParallelWorkers;
+            _supportedModels = catalogEntry.SupportedModels
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
         }
 
-        public string WorkerId { get; }
-        public string Name { get; }
-        public string GpuId { get; }
-        public int MaxConcurrentJobs { get; }
-        public int VramTotalMb { get; }
-        public Channel<Guid> Channel { get; }
-        public int TotalBatchesFormed => Volatile.Read(ref _totalBatchesFormed);
-        public int ActiveJobCount => Volatile.Read(ref _activeJobCount);
-        public int VramReservedMb => Volatile.Read(ref _vramReservedMb);
+        public string MachineId { get; }
+        public int TotalCapacityUnits { get; }
+        public int CpuScore { get; }
+        public int RamMb { get; }
+        public int GpuVramMb { get; }
+        public int MaxParallelWorkers { get; }
 
-        public bool TryReserve(InferenceJob job, out string? rejectionReason)
+        public int ActiveJobCount
         {
-            lock (_gate)
+            get
             {
-                if (job.Model is null || !_supportedModels.Contains(job.Model))
+                lock (_sync)
+                {
+                    return _reservedJobs.Count;
+                }
+            }
+        }
+
+        public int UsedCapacityUnits
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    return _reservedJobs.Values.Sum(x => x.CostUnits);
+                }
+            }
+        }
+
+        public Task EnqueueAsync(MachineAssignment assignment, CancellationToken cancellationToken)
+        {
+            return _mailbox.Writer.WriteAsync(assignment, cancellationToken).AsTask();
+        }
+
+        public bool TryAccept(InferenceJob job, JobResourceEstimate estimate, out string? rejectionReason)
+        {
+            lock (_sync)
+            {
+                if (!_enabled)
+                {
+                    rejectionReason = "MachineDisabled";
+                    return false;
+                }
+
+                if (job.Model is null)
+                {
+                    rejectionReason = "JobModelNotResolved";
+                    return false;
+                }
+
+                if (!_supportedModels.Contains(job.Model, StringComparer.OrdinalIgnoreCase))
                 {
                     rejectionReason = "ModelNotSupported";
                     return false;
                 }
 
-                if (_activeJobCount >= MaxConcurrentJobs)
+                if (_reservedJobs.Count >= MaxParallelWorkers)
                 {
                     rejectionReason = "NoExecutionSlot";
                     return false;
                 }
 
-                if (_currentModel is not null && !string.Equals(_currentModel, job.Model, StringComparison.OrdinalIgnoreCase))
+                var usedCapacityUnits = _reservedJobs.Values.Sum(x => x.CostUnits);
+                if (TotalCapacityUnits - usedCapacityUnits < estimate.EffectiveCostUnits)
                 {
-                    rejectionReason = "BatchModelMismatch";
+                    rejectionReason = "InsufficientCapacityUnits";
                     return false;
                 }
 
-                var availableMemory = VramTotalMb - _vramReservedMb;
-                if (availableMemory < job.RequiredMemoryMb)
+                var usedGpuVramMb = _reservedJobs.Values.Sum(x => x.RequiredMemoryMb);
+                if (GpuVramMb - usedGpuVramMb < job.RequiredMemoryMb)
                 {
-                    rejectionReason = "InsufficientVram";
+                    rejectionReason = "InsufficientGpuVram";
                     return false;
                 }
 
-                _currentModel ??= job.Model;
-                _activeJobCount++;
-                _vramReservedMb += job.RequiredMemoryMb;
-                _jobMemoryReservations[job.Id] = job.RequiredMemoryMb;
-                UpdateHeartbeat();
-
+                _reservedJobs[job.Id] = new ReservedJob(job.Id, job.Model, job.RequiredMemoryMb, estimate.EffectiveCostUnits);
+                _lastHeartbeatUtc = DateTime.UtcNow;
                 rejectionReason = null;
-                return true;
             }
+
+            QueueProjectionRefresh();
+            return true;
         }
 
-        public void ReleaseReservation(Guid jobId)
+        public async Task RunAsync(CancellationToken cancellationToken)
         {
-            lock (_gate)
-            {
-                if (!_jobMemoryReservations.Remove(jobId, out var reservedMemoryMb))
-                {
-                    return;
-                }
+            SetActorStatus(MachineActorStatus.Online);
+            await PublishProjectionAsync(cancellationToken);
 
-                _activeJobCount = Math.Max(0, _activeJobCount - 1);
-                _vramReservedMb = Math.Max(0, _vramReservedMb - reservedMemoryMb);
-                if (_jobMemoryReservations.Count == 0)
-                {
-                    _currentModel = null;
-                }
+            var loops = Enumerable.Range(0, Math.Max(1, MaxParallelWorkers))
+                .Select(_ => RunExecutionLoopAsync(cancellationToken))
+                .ToArray();
+
+            await Task.WhenAll(loops);
+        }
+
+        public async Task PublishHeartbeatAsync(CancellationToken cancellationToken)
+        {
+            lock (_sync)
+            {
+                _lastHeartbeatUtc = DateTime.UtcNow;
             }
+
+            await PublishProjectionAsync(cancellationToken);
         }
 
-        public void UpdateHeartbeat()
+        public async Task PublishOfflineAsync(CancellationToken cancellationToken)
         {
-            Interlocked.Exchange(ref _lastHeartbeatUtcTicks, DateTime.UtcNow.Ticks);
-        }
-
-        public void StartBatch(IReadOnlyCollection<InferenceJob> batch)
-        {
-            lock (_gate)
+            SetActorStatus(MachineActorStatus.Offline);
+            lock (_sync)
             {
-                _currentBatchSize = batch.Count;
-                _lastBatchModel = batch.FirstOrDefault()?.Model;
+                _lastHeartbeatUtc = DateTime.UtcNow;
             }
+
+            await _owner._machineLiveProjectionStore.PublishOfflineAsync(
+                BuildLiveProjection(),
+                _owner.GetHeartbeatTtl(),
+                cancellationToken);
         }
 
-        public void CompleteBatch(IReadOnlyCollection<InferenceJob> batch)
+        public WorkerState ToWorkerState()
         {
-            lock (_gate)
+            lock (_sync)
             {
-                foreach (var job in batch)
+                var reservedJobs = _reservedJobs.Values.ToArray();
+                var usedGpuVramMb = reservedJobs.Sum(x => x.RequiredMemoryMb);
+                var currentModel = _executingModels.Count switch
                 {
-                    if (!_jobMemoryReservations.Remove(job.Id, out var reservedMemoryMb))
-                    {
-                        continue;
-                    }
+                    0 => null,
+                    1 => _executingModels.Keys.First(),
+                    _ => "mixed"
+                };
 
-                    _activeJobCount = Math.Max(0, _activeJobCount - 1);
-                    _vramReservedMb = Math.Max(0, _vramReservedMb - reservedMemoryMb);
-                }
-
-                if (batch.Count > 0)
-                {
-                    _lastBatchSize = batch.Count;
-                    _lastBatchModel = batch.FirstOrDefault()?.Model;
-                    _lastBatchCompletedUtcTicks = DateTime.UtcNow.Ticks;
-                    _totalBatchesFormed++;
-                }
-
-                if (_jobMemoryReservations.Count == 0)
-                {
-                    _currentModel = null;
-                }
-
-                _currentBatchSize = 0;
-            }
-        }
-
-        public void MarkJobCompleted()
-        {
-            Interlocked.Increment(ref _completedJobCount);
-        }
-
-        public void MarkJobFailed()
-        {
-            Interlocked.Increment(ref _failedJobCount);
-        }
-
-        public void MarkJobRetried()
-        {
-            // Retries are tracked at the orchestration level. Worker state keeps only terminal failures.
-        }
-
-        public WorkerState ToState()
-        {
-            lock (_gate)
-            {
-                var status = ResolveStatus();
+                var status = reservedJobs.Length == 0
+                    ? WorkerStatus.Idle
+                    : reservedJobs.Length >= MaxParallelWorkers || usedGpuVramMb >= GpuVramMb
+                        ? WorkerStatus.Saturated
+                        : WorkerStatus.Busy;
 
                 return new WorkerState(
-                    WorkerId,
-                    Name,
-                    _activeJobCount,
-                    MaxConcurrentJobs,
-                    new DateTime(Interlocked.Read(ref _lastHeartbeatUtcTicks), DateTimeKind.Utc),
+                    MachineId,
+                    _machineName,
+                    reservedJobs.Length,
+                    MaxParallelWorkers,
+                    _lastHeartbeatUtc,
                     status,
-                    GpuId,
-                    VramTotalMb,
-                    _vramReservedMb,
-                    _supportedModels.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray(),
-                    _jobMemoryReservations.Keys.OrderBy(x => x).ToArray(),
-                    _currentModel,
+                    $"{MachineId}-gpu",
+                    GpuVramMb,
+                    usedGpuVramMb,
+                    _supportedModels,
+                    reservedJobs.Select(x => x.JobId).OrderBy(x => x).ToArray(),
+                    currentModel,
                     _currentBatchSize,
                     _totalBatchesFormed,
                     _lastBatchModel,
                     _lastBatchSize,
-                    _lastBatchCompletedUtcTicks == 0
-                        ? null
-                        : new DateTime(_lastBatchCompletedUtcTicks, DateTimeKind.Utc),
+                    _lastBatchCompletedUtc,
                     _completedJobCount,
                     _failedJobCount);
             }
         }
 
-        private WorkerStatus ResolveStatus()
+        public MachineActorSummary GetSummary()
         {
-            if (_activeJobCount == 0 && _vramReservedMb == 0)
+            lock (_sync)
             {
-                return WorkerStatus.Idle;
+                return new MachineActorSummary(
+                    _totalBatchesFormed,
+                    _lastBatchModel,
+                    _lastBatchSize,
+                    _lastBatchCompletedUtc,
+                    _completedJobCount,
+                    _failedJobCount);
+            }
+        }
+
+        private async Task RunExecutionLoopAsync(CancellationToken cancellationToken)
+        {
+            var reader = _mailbox.Reader;
+            var buffered = new Queue<MachineAssignment>();
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                MachineAssignment assignment;
+
+                if (buffered.Count > 0)
+                {
+                    assignment = buffered.Dequeue();
+                }
+                else
+                {
+                    try
+                    {
+                        assignment = await reader.ReadAsync(cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                }
+
+                await ProcessBatchAsync(reader, assignment, buffered, cancellationToken);
+            }
+        }
+
+        private async Task ProcessBatchAsync(
+            ChannelReader<MachineAssignment> reader,
+            MachineAssignment firstAssignment,
+            Queue<MachineAssignment> bufferedAssignments,
+            CancellationToken cancellationToken)
+        {
+            lock (_sync)
+            {
+                _lastHeartbeatUtc = DateTime.UtcNow;
             }
 
-            if (_activeJobCount >= MaxConcurrentJobs || _vramReservedMb >= VramTotalMb)
+            var batchJobs = new List<InferenceJob>();
+            var batchAssignments = new List<MachineAssignment>();
+            var batchModel = string.Empty;
+            var batchMemoryMb = 0;
+
+            try
             {
-                return WorkerStatus.Saturated;
+                var firstJob = await _owner.GetJobAsync(firstAssignment.JobId, cancellationToken);
+                if (firstJob is null)
+                {
+                    _owner._logger.LogWarning(
+                        "MachineActor {MachineId} received job {JobId} but durable state no longer exists.",
+                        MachineId,
+                        firstAssignment.JobId);
+                    ReleaseReservation(firstAssignment.JobId);
+                    return;
+                }
+
+                batchJobs.Add(firstJob);
+                batchAssignments.Add(firstAssignment);
+                batchModel = firstJob.Model ?? string.Empty;
+                batchMemoryMb = firstJob.RequiredMemoryMb;
+
+                var batchWindow = _owner._options.Batching.Enabled
+                    ? TimeSpan.FromMilliseconds(Math.Max(0, _owner._options.Batching.BatchWindowMs))
+                    : TimeSpan.Zero;
+                var deadlineUtc = DateTime.UtcNow.Add(batchWindow);
+
+                while (_owner._options.Batching.Enabled && batchAssignments.Count < Math.Max(1, _owner._options.Batching.MaxBatchSize))
+                {
+                    if (DateTime.UtcNow >= deadlineUtc)
+                    {
+                        break;
+                    }
+
+                    var nextAssignment = await TryReadNextCandidateAsync(reader, bufferedAssignments, deadlineUtc, cancellationToken);
+                    if (nextAssignment is null)
+                    {
+                        break;
+                    }
+
+                    var nextJob = await _owner.GetJobAsync(nextAssignment.Value.JobId, cancellationToken);
+                    if (nextJob is null)
+                    {
+                        _owner._logger.LogWarning(
+                            "MachineActor {MachineId} skipped missing job {JobId} during batch assembly.",
+                            MachineId,
+                            nextAssignment.Value.JobId);
+                        ReleaseReservation(nextAssignment.Value.JobId);
+                        continue;
+                    }
+
+                    if (!CanJoinBatch(batchModel, batchMemoryMb, nextJob))
+                    {
+                        bufferedAssignments.Enqueue(nextAssignment.Value);
+                        break;
+                    }
+
+                    batchJobs.Add(nextJob);
+                    batchAssignments.Add(nextAssignment.Value);
+                    batchMemoryMb += nextJob.RequiredMemoryMb;
+                }
+
+                StartBatch(batchJobs);
+                _owner.RecordBatchFormed(batchModel, batchJobs.Count);
+
+                _owner._logger.LogInformation(
+                    "MachineActor {MachineId} formed batch. BatchSize: {BatchSize}. Model: {Model}. BatchMemoryMb: {BatchMemoryMb}. CapacityUnits: {UsedCapacityUnits}/{TotalCapacityUnits}. GpuVramMb: {UsedGpuVramMb}/{GpuVramMb}.",
+                    MachineId,
+                    batchJobs.Count,
+                    batchModel,
+                    batchMemoryMb,
+                    UsedCapacityUnits,
+                    TotalCapacityUnits,
+                    ToWorkerState().VramReservedMb,
+                    GpuVramMb);
+
+                var startedAtUtc = DateTime.UtcNow;
+                foreach (var job in batchJobs)
+                {
+                    job.MarkProcessing(startedAtUtc);
+                    await _owner._jobStore.UpdateAsync(job, cancellationToken);
+                }
+
+                using var executionSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                executionSource.CancelAfter(Math.Max(250, _owner._options.Reliability.ExecutionTimeoutMs));
+
+                await SimulateBatchExecutionAsync(batchJobs, executionSource.Token);
+
+                foreach (var job in batchJobs)
+                {
+                    job.MarkCompleted($"Simulated response for prompt: {job.Prompt}", DateTime.UtcNow);
+                    await _owner._jobStore.UpdateAsync(job, cancellationToken);
+                    MarkJobCompleted();
+                    _owner.RecordJobFinalized(job, job.Model ?? "unknown", succeeded: true, failureCategory: null, terminal: false);
+
+                    var latency = BuildLatencySample(job);
+                    _owner._logger.LogInformation(
+                        "MachineActor {MachineId} completed job {JobId}. BatchSize: {BatchSize}. QueueWaitMs: {QueueWaitMs}. ExecutionMs: {ExecutionMs}. TotalLatencyMs: {TotalLatencyMs}.",
+                        MachineId,
+                        job.Id,
+                        batchJobs.Count,
+                        latency.QueueWaitMs,
+                        latency.ExecutionMs,
+                        latency.TotalLatencyMs);
+                }
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                await HandleBatchFailureAsync(
+                    batchJobs,
+                    JobFailureCategory.Timeout,
+                    "Execution timed out before the batch completed.",
+                    CancellationToken.None);
+            }
+            catch (NonRetryableExecutionException ex)
+            {
+                await HandleBatchFailureAsync(
+                    batchJobs,
+                    JobFailureCategory.NonRetryableError,
+                    ex.Message,
+                    CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                await HandleBatchFailureAsync(
+                    batchJobs,
+                    JobFailureCategory.ExecutionError,
+                    ex.Message,
+                    CancellationToken.None);
+            }
+            finally
+            {
+                CompleteBatch(batchJobs);
+
+                foreach (var assignment in batchAssignments)
+                {
+                    ReleaseReservation(assignment.JobId);
+                }
+
+                _owner._logger.LogInformation(
+                    "MachineActor {MachineId} released resources. BatchSize: {BatchSize}. ActiveJobs: {ActiveJobCount}/{MaxParallelWorkers}. CapacityUnits: {UsedCapacityUnits}/{TotalCapacityUnits}. GpuVramMb: {UsedGpuVramMb}/{GpuVramMb}. TotalBatchesFormed: {TotalBatchesFormed}.",
+                    MachineId,
+                    batchJobs.Count,
+                    ActiveJobCount,
+                    MaxParallelWorkers,
+                    UsedCapacityUnits,
+                    TotalCapacityUnits,
+                    ToWorkerState().VramReservedMb,
+                    GpuVramMb,
+                    GetSummary().TotalBatchesFormed);
+            }
+        }
+
+        private async Task HandleBatchFailureAsync(
+            IReadOnlyCollection<InferenceJob> batch,
+            JobFailureCategory category,
+            string failureReason,
+            CancellationToken cancellationToken)
+        {
+            foreach (var job in batch)
+            {
+                var timestampUtc = DateTime.UtcNow;
+
+                if (category == JobFailureCategory.Timeout)
+                {
+                    Interlocked.Increment(ref _owner._totalJobsTimedOut);
+                }
+
+                if (IsRetryable(category) && job.CanRetry())
+                {
+                    job.MarkRetrying(failureReason, category, timestampUtc);
+                    await _owner._jobStore.UpdateAsync(job, cancellationToken);
+                    _owner.EnqueueRetry(job, category);
+                    _owner.RecordJobRetried(category);
+
+                    _owner._logger.LogWarning(
+                        "MachineActor {MachineId} scheduled retry for job {JobId}. FailureCategory: {FailureCategory}. Attempt: {RetryCount}/{MaxRetries}. RetryDelayMs: {RetryDelayMs}.",
+                        MachineId,
+                        job.Id,
+                        category,
+                        job.RetryCount,
+                        job.MaxRetries,
+                        _owner._options.Reliability.RetryDelayMs);
+
+                    continue;
+                }
+
+                var terminalReason = IsRetryable(category) && !job.CanRetry()
+                    ? $"Retry exhausted after {category}: {failureReason}"
+                    : failureReason;
+
+                var terminalCategory = IsRetryable(category) && !job.CanRetry()
+                    ? JobFailureCategory.RetryExhausted
+                    : category;
+
+                job.MarkDeadLettered(terminalReason, terminalCategory, timestampUtc);
+                await _owner._jobStore.UpdateAsync(job, cancellationToken);
+                MarkJobFailed();
+                _owner.RecordJobFinalized(job, job.Model ?? "unknown", succeeded: false, failureCategory: terminalCategory, terminal: true);
+
+                if (terminalCategory == JobFailureCategory.RetryExhausted)
+                {
+                    Interlocked.Increment(ref _owner._retryExhaustedCount);
+                }
+
+                _owner._logger.LogError(
+                    "MachineActor {MachineId} moved job {JobId} to dead letter. FailureCategory: {FailureCategory}. RetryCount: {RetryCount}/{MaxRetries}.",
+                    MachineId,
+                    job.Id,
+                    terminalCategory,
+                    job.RetryCount,
+                    job.MaxRetries);
+            }
+        }
+
+        private async Task SimulateBatchExecutionAsync(IReadOnlyCollection<InferenceJob> batch, CancellationToken cancellationToken)
+        {
+            if (batch.Any(job => PromptContains(job, "fail-terminal")))
+            {
+                throw new NonRetryableExecutionException("Simulated non-retryable execution error.");
             }
 
-            return WorkerStatus.Busy;
+            if (batch.Any(job => PromptContains(job, "fail-always")))
+            {
+                throw new InvalidOperationException("Simulated retryable execution failure.");
+            }
+
+            if (batch.Any(job => PromptContains(job, "fail-retry-once") && job.RetryCount == 0))
+            {
+                throw new InvalidOperationException("Simulated retryable execution failure on first attempt.");
+            }
+
+            var delayMs = Random.Shared.Next(1500, 2501) + ((batch.Count - 1) * 150);
+            if (batch.Any(job => PromptContains(job, "slow-timeout")))
+            {
+                delayMs = Math.Max(delayMs, _owner._options.Reliability.ExecutionTimeoutMs + 500);
+            }
+
+            await Task.Delay(delayMs, cancellationToken);
+        }
+
+        private async Task<MachineAssignment?> TryReadNextCandidateAsync(
+            ChannelReader<MachineAssignment> reader,
+            Queue<MachineAssignment> bufferedAssignments,
+            DateTime deadlineUtc,
+            CancellationToken cancellationToken)
+        {
+            if (bufferedAssignments.Count > 0)
+            {
+                return bufferedAssignments.Dequeue();
+            }
+
+            var remaining = deadlineUtc - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+            {
+                return null;
+            }
+
+            using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            linkedSource.CancelAfter(remaining);
+
+            try
+            {
+                return await reader.ReadAsync(linkedSource.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                return null;
+            }
+        }
+
+        private bool CanJoinBatch(string batchModel, int batchMemoryMb, InferenceJob nextJob)
+        {
+            if (!string.Equals(batchModel, nextJob.Model, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var maxBatchMemoryMb = Math.Max(1, _owner._options.Batching.MaxBatchMemoryMb);
+            return batchMemoryMb + nextJob.RequiredMemoryMb <= maxBatchMemoryMb;
+        }
+
+        private void StartBatch(IReadOnlyCollection<InferenceJob> batch)
+        {
+            lock (_sync)
+            {
+                _currentBatchSize += batch.Count;
+                _totalBatchesFormed++;
+                _lastBatchModel = batch.FirstOrDefault()?.Model;
+                _lastBatchSize = batch.Count;
+
+                foreach (var job in batch)
+                {
+                    if (job.Model is null)
+                    {
+                        continue;
+                    }
+
+                    _executingModels.TryGetValue(job.Model, out var current);
+                    _executingModels[job.Model] = current + 1;
+                }
+
+                _lastHeartbeatUtc = DateTime.UtcNow;
+            }
+
+            QueueProjectionRefresh();
+        }
+
+        private void CompleteBatch(IReadOnlyCollection<InferenceJob> batch)
+        {
+            lock (_sync)
+            {
+                _currentBatchSize = Math.Max(0, _currentBatchSize - batch.Count);
+                _lastBatchCompletedUtc = DateTime.UtcNow;
+                _lastHeartbeatUtc = DateTime.UtcNow;
+
+                foreach (var job in batch)
+                {
+                    if (job.Model is null || !_executingModels.TryGetValue(job.Model, out var current))
+                    {
+                        continue;
+                    }
+
+                    if (current <= 1)
+                    {
+                        _executingModels.Remove(job.Model);
+                    }
+                    else
+                    {
+                        _executingModels[job.Model] = current - 1;
+                    }
+                }
+            }
+
+            QueueProjectionRefresh();
+        }
+
+        private void ReleaseReservation(Guid jobId)
+        {
+            lock (_sync)
+            {
+                _reservedJobs.Remove(jobId);
+                _lastHeartbeatUtc = DateTime.UtcNow;
+            }
+
+            QueueProjectionRefresh();
+        }
+
+        private void MarkJobCompleted()
+        {
+            lock (_sync)
+            {
+                _completedJobCount++;
+            }
+        }
+
+        private void MarkJobFailed()
+        {
+            lock (_sync)
+            {
+                _failedJobCount++;
+            }
+        }
+
+        private void SetActorStatus(MachineActorStatus actorStatus)
+        {
+            lock (_sync)
+            {
+                _actorStatus = actorStatus;
+            }
+        }
+
+        private MachineLiveProjection BuildLiveProjection()
+        {
+            lock (_sync)
+            {
+                var reservedJobs = _reservedJobs.Values.ToArray();
+                var usedCapacityUnits = reservedJobs.Sum(x => x.CostUnits);
+                var reservedVramMb = reservedJobs.Sum(x => x.RequiredMemoryMb);
+                var currentModel = _executingModels.Count switch
+                {
+                    0 => null,
+                    1 => _executingModels.Keys.First(),
+                    _ => "mixed"
+                };
+
+                var runtimeStatus = reservedJobs.Length == 0
+                    ? MachineStatus.Idle
+                    : reservedJobs.Length >= MaxParallelWorkers || usedCapacityUnits >= TotalCapacityUnits || reservedVramMb >= GpuVramMb
+                        ? MachineStatus.Saturated
+                        : MachineStatus.Busy;
+
+                return new MachineLiveProjection(
+                    MachineId,
+                    _actorInstanceId,
+                    _actorStatus,
+                    _lastHeartbeatUtc,
+                    usedCapacityUnits,
+                    Math.Max(0, TotalCapacityUnits - usedCapacityUnits),
+                    reservedJobs.Length,
+                    reservedVramMb,
+                    reservedJobs.Select(x => x.JobId).OrderBy(x => x).ToArray(),
+                    _currentBatchSize,
+                    currentModel,
+                    runtimeStatus);
+            }
+        }
+
+        private async Task PublishProjectionAsync(CancellationToken cancellationToken)
+        {
+            var projection = BuildLiveProjection();
+            await _owner._machineLiveProjectionStore.PublishAsync(projection, _owner.GetHeartbeatTtl(), cancellationToken);
+
+            _owner._logger.LogDebug(
+                "Published machine heartbeat projection. MachineId: {MachineId}. ActorStatus: {ActorStatus}. ActiveJobCount: {ActiveJobCount}. UsedCapacityUnits: {UsedCapacityUnits}. ReservedVramMb: {ReservedVramMb}.",
+                projection.MachineId,
+                projection.ActorStatus,
+                projection.ActiveJobCount,
+                projection.UsedCapacityUnits,
+                projection.ReservedVramMb);
+        }
+
+        private void QueueProjectionRefresh()
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await PublishProjectionAsync(CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _owner._logger.LogWarning(ex, "Failed to refresh live projection for machine {MachineId}.", MachineId);
+                }
+            });
         }
     }
+
+    private TimeSpan GetHeartbeatTtl()
+    {
+        return TimeSpan.FromSeconds(Math.Max(
+            _options.WorkerExecution.HeartbeatIntervalSeconds + 1,
+            _options.WorkerExecution.HeartbeatTtlSeconds));
+    }
+
+    private readonly record struct DeferredJob(Guid JobId, DateTime RetryAfterUtc, string Reason);
+    private readonly record struct RetryJob(Guid JobId, DateTime RetryAfterUtc, JobFailureCategory FailureCategory, int RetryCount, int MaxRetries);
+    private readonly record struct LatencySample(long QueueWaitMs, long ExecutionMs, long TotalLatencyMs);
+    private readonly record struct MachineAssignment(Guid JobId, JobResourceEstimate Estimate);
+    private readonly record struct ReservedJob(Guid JobId, string? Model, int RequiredMemoryMb, int CostUnits);
+    private readonly record struct FairShareSnapshot(
+        IReadOnlyDictionary<string, int> BandBufferDepths,
+        IReadOnlyDictionary<string, int> BandCredits);
+    private readonly record struct MachineActorSummary(
+        int TotalBatchesFormed,
+        string? LastBatchModel,
+        int LastBatchSize,
+        DateTime? LastBatchCompletedUtc,
+        int CompletedJobCount,
+        int FailedJobCount);
 
     private sealed class NonRetryableExecutionException : Exception
     {
