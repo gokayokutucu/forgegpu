@@ -488,8 +488,7 @@ Useful commands:
 ```
 
 Local runtime note:
-- local development uses a ZooKeeper-less Kafka-compatible runtime
-- the repository currently uses Redpanda in Docker Compose for simple local Kafka semantics
+- local development uses Redpanda in Docker Compose for simple Kafka-compatible ingress semantics
 
 ## What This Demonstrates for Infrastructure Platform Work
 
